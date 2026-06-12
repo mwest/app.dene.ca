@@ -249,7 +249,7 @@ api.get('/projects/:id/members', requireProjectAdmin, (req, res) => {
 api.post('/projects/:id/members', requireProjectAdmin, async (req, res) => {
   const { email, name, password, role } = req.body ?? {};
   if (!email || !String(email).trim()) return bad(res, 'Email is required');
-  const memberRole = role === 'admin' ? 'admin' : 'member';
+  const memberRole = ['admin', 'translator'].includes(role) ? role : 'member';
   if (memberRole === 'admin' && !req.user.is_superadmin) {
     return bad(res, 'Only the superadmin can assign project admins', 403);
   }
@@ -279,7 +279,9 @@ api.post('/projects/:id/members', requireProjectAdmin, async (req, res) => {
     .get(user.id, req.project.id);
   if (existing) {
     if (existing.role === memberRole) return bad(res, 'Already a member of this project');
-    if (!req.user.is_superadmin) return bad(res, 'Only the superadmin can change roles', 403);
+    if ((existing.role === 'admin' || memberRole === 'admin') && !req.user.is_superadmin) {
+      return bad(res, 'Only the superadmin can change admin roles', 403);
+    }
     db.prepare('UPDATE memberships SET role = ? WHERE user_id = ? AND project_id = ?').run(
       memberRole, user.id, req.project.id
     );
@@ -507,14 +509,21 @@ function loadEntry(req, res, next) {
   next();
 }
 
+// Translators contribute recordings only — no entry editing even for entries
+// they happen to have created under a previous role.
 const canEditEntry = (req) =>
-  req.projectRole === 'admin' || req.entry.created_by === req.user.id;
+  req.projectRole === 'admin' ||
+  (req.projectRole === 'member' && req.entry.created_by === req.user.id);
 
 api.post('/entries', (req, res) => {
   const { project_id, dene_text, english_text, source_doc, notes, category } = req.body ?? {};
   const projectId = Number(project_id);
-  if (!projectId || !roleIn(req.user, projectId)) {
+  const role = roleIn(req.user, projectId);
+  if (!projectId || !role) {
     return bad(res, 'You are not a member of that project', 403);
+  }
+  if (role === 'translator') {
+    return bad(res, 'Translators add recordings, not entries', 403);
   }
   if (!dene_text?.trim() || !english_text?.trim()) {
     return bad(res, 'Both Dene text and English text are required');

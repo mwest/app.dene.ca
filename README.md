@@ -38,6 +38,12 @@ admins; project admins manage their own project's members. There is no public si
 | Superadmin | Everything, across all projects; creates projects and project admins |
 | Project admin | Manage members, review/verify entries, export, edit any entry — in their project only |
 | Member | Create entries, edit/delete their own entries, upload audio, search within their projects |
+| Translator | Recording only — sees a stripped-down app that cycles through entries without audio so they can record them; cannot create or edit entries |
+
+Translators land on a dashboard with a single **Start recording session** button. Each
+card shows the Dene text large, the English below it, a record/playback control, and the
+entry's metadata, with **Save & next** / **Save & exit** (and **Skip**) to move through
+the queue. Project admins assign the role from the project's **Members** page.
 
 Removing a member takes effect immediately (membership is checked on every request);
 their past contributions remain attributed to them.

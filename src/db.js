@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS memberships (
   user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  role       TEXT NOT NULL CHECK (role IN ('admin', 'member')),
+  role       TEXT NOT NULL CHECK (role IN ('admin', 'member', 'translator')),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (user_id, project_id)
 );
@@ -104,6 +104,30 @@ if (!entryCols.includes('category')) {
   db.exec(`ALTER TABLE entries ADD COLUMN category TEXT`);
 }
 
+// Migration: 'translator' membership role. SQLite cannot alter a CHECK
+// constraint, so older databases get the memberships table rebuilt once.
+const memTableSql = db
+  .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memberships'`)
+  .get().sql;
+if (!memTableSql.includes('translator')) {
+  db.pragma('foreign_keys = OFF');
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE memberships_new (
+        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        role       TEXT NOT NULL CHECK (role IN ('admin', 'member', 'translator')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (user_id, project_id)
+      );
+      INSERT INTO memberships_new SELECT user_id, project_id, role, created_at FROM memberships;
+      DROP TABLE memberships;
+      ALTER TABLE memberships_new RENAME TO memberships;
+    `);
+  })();
+  db.pragma('foreign_keys = ON');
+}
+
 // Each user gets at most one recording per language per entry.
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_one_per_lang
          ON audio_files(entry_id, uploaded_by, language)`);
@@ -113,7 +137,7 @@ export default db;
 // ---- Role helpers -------------------------------------------------------
 
 /**
- * Effective role of a user in a project: 'admin', 'member', or null.
+ * Effective role of a user in a project: 'admin', 'member', 'translator', or null.
  * Superadmins are implicit admins of every project.
  */
 export function roleIn(user, projectId) {

@@ -92,6 +92,11 @@ function isAdminOf(projectId) {
   return p?.role === 'admin';
 }
 
+// Translators get a focused recording-only view of the app.
+function isTranslator() {
+  return !state.me?.user.is_superadmin && activeProject()?.role === 'translator';
+}
+
 // ---------------------------------------------------------------------------
 // Dene character palette
 // ---------------------------------------------------------------------------
@@ -220,6 +225,7 @@ function renderTopbar() {
   bar.hidden = false;
   $('#user-menu-btn').textContent = `${state.me.user.name} ▾`;
   $('#nav-users').hidden = !state.me.user.is_superadmin;
+  $('#topbar nav a[data-nav="entries"]').hidden = isTranslator();
 
   const sw = $('#project-switcher');
   const projects = state.me.projects;
@@ -240,6 +246,7 @@ $('#project-switcher').addEventListener('change', (e) => {
   // entry list filters are project-specific — reset them on switch
   listState.contributor = '';
   listState.offset = 0;
+  renderTopbar(); // nav differs per role (translator vs member)
   route(); // re-render current view with new context
 });
 
@@ -873,6 +880,210 @@ function audioItemHtml(a, entry) {
 }
 
 // ---------------------------------------------------------------------------
+// Translator dashboard — one big button, more to come later
+// ---------------------------------------------------------------------------
+
+async function renderTranslatorDashboard() {
+  setActiveNav('dashboard');
+  const p = activeProject();
+  if (!p) {
+    view.innerHTML = `<div class="empty">You are not a member of any project yet.<br>
+      Ask your project admin to add you.</div>`;
+    return;
+  }
+  view.innerHTML = `
+    <div class="translator-home">
+      <h1>Welcome, ${esc(state.me.user.name)}</h1>
+      <p class="translator-project">${esc(p.name)}${p.dialect ? ` — ${esc(p.dialect)}` : ''}</p>
+      <p class="queue-count" id="queue-count">&nbsp;</p>
+      <button class="big-action" id="start-session">⏺ Start recording session</button>
+    </div>`;
+  $('#start-session').addEventListener('click', () => { location.hash = '#/record'; });
+  try {
+    const data = await api(`/entries?project_id=${p.id}&has_audio=no&limit=1`);
+    $('#queue-count').textContent = data.total === 0
+      ? 'Every entry has a recording — check back later.'
+      : `${data.total} ${data.total === 1 ? 'entry needs' : 'entries need'} a recording.`;
+    if (data.total === 0) $('#start-session').disabled = true;
+  } catch { /* count is decorative — the session view reports errors itself */ }
+}
+
+// ---------------------------------------------------------------------------
+// Recording session — cycle through entries that have no audio yet
+// ---------------------------------------------------------------------------
+
+const recSession = { queue: [], pos: 0, total: 0 };
+
+async function renderRecordSession() {
+  setActiveNav('dashboard');
+  const p = activeProject();
+  if (!p) { location.hash = '#/dashboard'; return; }
+  view.innerHTML = `<div class="empty">Loading…</div>`;
+  let data;
+  try { data = await api(`/entries?project_id=${p.id}&has_audio=no&limit=200`); }
+  catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+  recSession.queue = data.entries;
+  recSession.pos = 0;
+  recSession.total = data.total;
+  renderRecordCard();
+}
+
+function renderRecordCard() {
+  const entry = recSession.queue[recSession.pos];
+  if (!entry) { renderRecordDone(); return; }
+
+  const badges = [
+    entry.category ? `<span class="badge">${esc(entry.category)}</span>` : '',
+    entry.status !== 'draft' ? `<span class="badge status-${entry.status}">${entry.status}</span>` : '',
+  ].filter(Boolean).join(' ');
+
+  view.innerHTML = `
+    <div class="rec-session">
+      <div class="rec-progress">
+        <a href="#/dashboard">‹ Exit</a>
+        <span>${recSession.pos + 1} of ${recSession.queue.length}${recSession.total > recSession.queue.length ? ` (${recSession.total} waiting in total)` : ''}</span>
+        <span>${esc(entry.project_name)}</span>
+      </div>
+      <div class="card rec-card">
+        <div class="rec-dene dene" lang="den">${esc(entry.dene_text)}</div>
+        <div class="rec-english">${esc(entry.english_text)}</div>
+        <div class="rec-stage" id="rec-stage"></div>
+        <div class="rec-meta">
+          ${badges ? `<div>${badges}</div>` : ''}
+          ${entry.source_doc ? `<div>Source: ${esc(entry.source_doc)}</div>` : ''}
+          ${entry.notes ? `<div>Notes: ${esc(entry.notes)}</div>` : ''}
+          <div>Added by ${esc(entry.created_by_name)} · ${fmtDate(entry.created_at)}</div>
+        </div>
+      </div>
+      <div class="rec-actions">
+        <button class="secondary" id="save-exit" disabled>Save &amp; exit</button>
+        <button id="save-next" disabled>Save &amp; next</button>
+        <button class="ghost" id="skip-btn">Skip ›</button>
+      </div>
+    </div>`;
+
+  setupSessionRecorder(entry);
+}
+
+function renderRecordDone() {
+  view.innerHTML = `
+    <div class="translator-home">
+      <h1>All done 🎉</h1>
+      <p class="queue-count">You went through every entry in this list. Mahsi cho!</p>
+      <div class="rec-actions">
+        <button class="secondary" id="back-dash">Back to dashboard</button>
+        <button id="check-more">Check for more</button>
+      </div>
+    </div>`;
+  $('#back-dash').addEventListener('click', () => { location.hash = '#/dashboard'; });
+  $('#check-more').addEventListener('click', renderRecordSession);
+}
+
+/** Record → preview → save flow for one entry card. */
+function setupSessionRecorder(entry) {
+  const stage = $('#rec-stage');
+  const saveExit = $('#save-exit');
+  const saveNext = $('#save-next');
+  const skipBtn = $('#skip-btn');
+  let blob = null;
+  let blobUrl = null;
+  let timer = null;
+
+  function showIdle() {
+    stage.innerHTML = `<button type="button" class="rec-btn big-action" id="rec-start">⏺ Record</button>`;
+    $('#rec-start').addEventListener('click', startRec);
+  }
+
+  function showPreview() {
+    stage.innerHTML = `
+      <audio controls src="${blobUrl}"></audio>
+      <button type="button" class="ghost" id="rec-again">⏺ Re-record</button>`;
+    $('#rec-again').addEventListener('click', () => {
+      URL.revokeObjectURL(blobUrl);
+      blob = null;
+      blobUrl = null;
+      saveExit.disabled = saveNext.disabled = true;
+      startRec();
+    });
+  }
+
+  async function startRec() {
+    if (Recorder.session) return;
+    try {
+      await Recorder.start();
+    } catch {
+      toast('Could not access the microphone — check browser permissions', true);
+      return;
+    }
+    const started = Date.now();
+    stage.innerHTML = `
+      <span class="rec-live"><span class="rec-dot"></span> Recording — <span id="rec-time">0:00</span></span>
+      <button type="button" id="rec-stop">■ Stop</button>
+      <button type="button" class="ghost" id="rec-cancel">Cancel</button>`;
+    timer = setInterval(() => {
+      const s = Math.floor((Date.now() - started) / 1000);
+      const t = $('#rec-time');
+      if (t) t.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+    }, 250);
+    $('#rec-stop').addEventListener('click', async () => {
+      clearInterval(timer);
+      try {
+        blob = await Recorder.stop();
+        if (!blob || blob.size === 0) throw new Error('Nothing was recorded');
+      } catch (err) {
+        toast(err.message, true);
+        showIdle();
+        return;
+      }
+      blobUrl = URL.createObjectURL(blob);
+      saveExit.disabled = saveNext.disabled = false;
+      showPreview();
+    });
+    $('#rec-cancel').addEventListener('click', async () => {
+      clearInterval(timer);
+      await Recorder.cancel();
+      showIdle();
+    });
+  }
+
+  async function save() {
+    const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+    const fd = new FormData();
+    fd.append('file', blob, `dene-entry${entry.id}-${stamp}.mp3`);
+    fd.append('language', 'dene');
+    fd.append('speaker', state.me.user.name);
+    fd.append('recording_notes', 'recorded in browser');
+    await api(`/entries/${entry.id}/audio`, { method: 'POST', body: fd });
+    URL.revokeObjectURL(blobUrl);
+  }
+
+  async function saveThen(after) {
+    saveExit.disabled = saveNext.disabled = skipBtn.disabled = true;
+    try {
+      await save();
+    } catch (err) {
+      toast(err.message, true);
+      saveExit.disabled = saveNext.disabled = skipBtn.disabled = false;
+      return;
+    }
+    toast('Recording saved');
+    after();
+  }
+
+  saveExit.addEventListener('click', () => saveThen(() => { location.hash = '#/dashboard'; }));
+  saveNext.addEventListener('click', () => saveThen(() => { recSession.pos++; renderRecordCard(); }));
+  skipBtn.addEventListener('click', async () => {
+    clearInterval(timer);
+    if (Recorder.session) await Recorder.cancel();
+    if (blobUrl) URL.revokeObjectURL(blobUrl);
+    recSession.pos++;
+    renderRecordCard();
+  });
+
+  showIdle();
+}
+
+// ---------------------------------------------------------------------------
 // Dashboard view
 // ---------------------------------------------------------------------------
 
@@ -1145,7 +1356,7 @@ async function renderMembers(projectId) {
             <tr>
               <td>${esc(mb.name)}</td>
               <td>${esc(mb.email)}</td>
-              <td><span class="badge">${mb.role === 'admin' ? 'Project admin' : 'Member'}</span></td>
+              <td><span class="badge">${{ admin: 'Project admin', translator: 'Translator' }[mb.role] ?? 'Member'}</span></td>
               <td>${mb.entry_count}</td>
               <td>${fmtDate(mb.created_at)}</td>
               <td>${mb.role === 'admin' && !isSuper ? '' :
@@ -1169,12 +1380,12 @@ async function renderMembers(projectId) {
           <label class="field"><span>Temporary password (optional)</span>
             <input type="text" name="password" minlength="8" autocomplete="off"
               placeholder="blank = email an invite"></label>
-          ${isSuper ? `
           <label class="field"><span>Role</span>
             <select name="role">
               <option value="member">Member</option>
-              <option value="admin">Project admin</option>
-            </select></label>` : ''}
+              <option value="translator">Translator</option>
+              ${isSuper ? '<option value="admin">Project admin</option>' : ''}
+            </select></label>
         </div>
         <p class="error-msg" hidden></p>
         <button type="submit">Add member</button>
@@ -1342,12 +1553,20 @@ async function loadMe() {
 
 function route() {
   view.onclick = null; // clear any per-view delegated handler
+  if (Recorder.session) Recorder.cancel(); // navigating away releases the mic
   const hash = location.hash || '#/entries';
   let m;
   // Views that work without a session:
   if ((m = hash.match(/^#\/set-password\/([a-f0-9]{64})$/))) { renderSetPassword(m[1]); return; }
   if (hash === '#/forgot') { renderForgot(); return; }
   if (!state.me) { renderLogin(); return; }
+  if (isTranslator()) {
+    // Translators see only their dashboard and the recording session.
+    if (hash === '#/record') renderRecordSession();
+    else if (hash === '#/dashboard') renderTranslatorDashboard();
+    else location.hash = '#/dashboard';
+    return;
+  }
   if (hash === '#/entries') renderEntries();
   else if (hash === '#/entries/new') renderNewEntry();
   else if ((m = hash.match(/^#\/entries\/(\d+)$/))) renderEntryDetail(m[1]);

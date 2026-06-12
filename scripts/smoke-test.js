@@ -244,9 +244,42 @@ check('admin sees all recordings', r.status === 200 && r.data.audio.length === 3
 r = await sa.req('GET', `/api/audio/${member2AudioId}/stream`);
 check("admin can stream members' recordings", r.status === 200);
 
+// --- translator role: records audio, cannot touch entries ---
+const translatorEmail = `translator${Date.now()}@test.ca`;
+r = await sa.req('POST', `/api/projects/${projectId}/members`,
+  { email: translatorEmail, name: 'Test Translator', password: 'translator-pass-1', role: 'translator' });
+check('admin creates translator account', r.status === 201, JSON.stringify(r.data));
+
+const translator = client();
+r = await translator.req('POST', '/api/login', { email: translatorEmail, password: 'translator-pass-1' });
+check('translator login', r.status === 200);
+
+r = await translator.req('GET', '/api/projects');
+check('translator sees project with translator role', r.status === 200 &&
+  r.data.projects[0]?.role === 'translator', JSON.stringify(r.data));
+
+r = await translator.req('POST', '/api/entries',
+  { project_id: projectId, dene_text: 'x', english_text: 'y' });
+check('translator cannot create entries', r.status === 403);
+
+r = await translator.req('PATCH', `/api/entries/${entryId}`, { english_text: 'nope' });
+check('translator cannot edit entries', r.status === 403);
+
+r = await translator.req('GET', `/api/entries?project_id=${projectId}&has_audio=no`);
+check('translator lists entries without audio (recording queue)', r.status === 200 &&
+  r.data.entries.every((e) => e.audio_count === 0), JSON.stringify(r.data.total));
+
+fd = new FormData();
+fd.append('file', new Blob([makeWav(2)], { type: 'audio/wav' }), 'translator-dene.wav');
+fd.append('language', 'dene');
+r = await translator.req('POST', `/api/entries/${entryId}/audio`, fd, true);
+check('translator records audio on an entry', r.status === 201, JSON.stringify(r.data));
+const translatorAudioId = r.data?.id;
+
 // clean up the extra clips so the stats checks below stay simple
 await member.req('DELETE', `/api/audio/${englishAudioId}`);
 await member2.req('DELETE', `/api/audio/${member2AudioId}`);
+await translator.req('DELETE', `/api/audio/${translatorAudioId}`);
 
 // --- stats & export ---
 r = await sa.req('GET', `/api/projects/${projectId}/stats`);
