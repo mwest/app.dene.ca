@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dene Voice Library</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='80' font-size='80'>🪶</text></svg>">
+</head>
+<body>
+  <header id="topbar" hidden>
+    <div class="brand"><span class="brand-mark">🪶</span> Dene Voice Library</div>
+    <nav>
+      <a href="#/entries" data-nav="entries">Entries</a>
+      <a href="#/dashboard" data-nav="dashboard">Dashboard</a>
+      <a href="#/users" data-nav="users" id="nav-users" hidden>Users</a>
+    </nav>
+    <div class="topbar-right">
+      <label class="project-switcher" title="Active project for new entries">
+        <span>Project:</span>
+        <select id="project-switcher"></select>
+      </label>
+      <div class="user-menu">
+        <button id="user-menu-btn" class="ghost"></button>
+        <div id="user-menu-dropdown" class="dropdown" hidden>
+          <button id="change-password-btn">Change password</button>
+          <button id="logout-btn">Sign out</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main id="view"></main>
+
+  <div id="toast" hidden></div>
+
+  <script src="/vendor/lame.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

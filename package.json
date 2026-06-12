@@ -1,0 +1,21 @@
+{
+  "name": "dene-translation-db",
+  "version": "1.0.0",
+  "description": "Dene-English Translation Database for the Dene Voice Project (dene.ca)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "create-superadmin": "node scripts/create-superadmin.js"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^12.10.0",
+    "cookie-parser": "^1.4.7",
+    "express": "^5.2.1",
+    "lamejs": "^1.2.1",
+    "multer": "^2.1.1",
+    "music-metadata": "^11.13.0"
+  }
+}
