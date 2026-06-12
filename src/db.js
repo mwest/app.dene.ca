@@ -7,8 +7,11 @@ export const DATA_DIR = path.join(ROOT, 'data');
 // Audio lives at data/audio/<uploader user id>/<file>; stored_name in the DB
 // is the path relative to AUDIO_DIR (e.g. "3/a1b2c3.mp3").
 export const AUDIO_DIR = path.join(DATA_DIR, 'audio');
+// Public translation-request uploads: data/requests/<request id>/<file>.
+export const REQUESTS_DIR = path.join(DATA_DIR, 'requests');
 
 fs.mkdirSync(AUDIO_DIR, { recursive: true });
+fs.mkdirSync(REQUESTS_DIR, { recursive: true });
 
 const db = new Database(path.join(DATA_DIR, 'dene.db'));
 db.pragma('journal_mode = WAL');
@@ -89,6 +92,32 @@ CREATE TABLE IF NOT EXISTS audio_files (
   created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_audio_entry ON audio_files(entry_id);
+
+-- Public translation requests: a tokened form link is emailed to the
+-- requester ('invited'); once they submit, superadmins see it as a job.
+CREATE TABLE IF NOT EXISTS translation_requests (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_hash   TEXT NOT NULL UNIQUE,
+  email        TEXT NOT NULL COLLATE NOCASE,
+  name         TEXT,
+  dialect      TEXT,
+  details      TEXT,
+  status       TEXT NOT NULL DEFAULT 'invited' CHECK (status IN ('invited', 'submitted')),
+  expires_at   TEXT NOT NULL,
+  submitted_at TEXT,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS request_files (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id    INTEGER NOT NULL REFERENCES translation_requests(id) ON DELETE CASCADE,
+  stored_name   TEXT NOT NULL,
+  original_name TEXT NOT NULL,
+  mime_type     TEXT NOT NULL,
+  size_bytes    INTEGER NOT NULL,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_request_files_request ON request_files(request_id);
 `);
 
 // Migration: language tag on recordings ('dene' or 'english').

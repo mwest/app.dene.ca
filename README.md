@@ -54,18 +54,33 @@ Each entry shows two recording slots per user: **Dene** and **English**. Click r
 speak, click **Stop & save** — the clip is encoded to MP3 in the browser, tagged with its
 language and the speaker, and attached automatically. Each user has at most **one
 recording per language per entry** (enforced by a unique index); re-recording or
-re-uploading the same language replaces the previous clip. Recordings are **private to
-their contributor** — members see and play only their own; project admins and superadmins
-see all recordings on entries in their projects (needed for review and export).
+re-uploading the same language replaces the previous clip. Recordings are **visible to
+the whole project** — every member can see and play all recordings on entries in their
+projects; editing or deleting a recording is still restricted to its uploader, project
+admins, and superadmins.
 Uploading existing files (WAV/MP3/M4A) is still available under
 "Upload an audio file instead". Microphone access requires a secure context:
 `localhost` works out of the box; a LAN/production deployment needs HTTPS.
 
+## Public translation requests
+
+People outside the app can ask for a translation: the sign-in page links to a public
+form (`#/request`) where they enter their email and receive a unique, single-use form
+link (valid 7 days). The form fixes the email server-side and collects name, required
+Dene dialect, details, and up to 5 files (100 MB each; documents, images, audio, video,
+zip). On submission every superadmin gets an email with the details and a link into the
+app, where requests appear under the **Translation Jobs** tab (superadmin-only) with
+the uploaded files viewable/downloadable. Public endpoints are rate-limited; uploaded
+files are always served as attachments (audio may stream inline) so untrusted content
+never executes on the app origin.
+
 ## Data layout
 
-- `data/dene.db` — SQLite database (users, sessions, projects, memberships, entries, audio_files)
+- `data/dene.db` — SQLite database (users, sessions, projects, memberships, entries,
+  audio_files, translation_requests, request_files)
 - `data/audio/<userID>/<file>` — audio files, organized per uploader (random file names;
   original filenames kept in the DB)
+- `data/requests/<requestID>/<file>` — files uploaded with public translation requests
 - Exports reference audio as `audio/<userID>/<file>`, so an export plus a copy of
   `data/audio/` is a complete training bundle. Recordings carry a `language` tag
   (`dene` or `english`); the CSV export has separate `dene_audio_files` and
@@ -85,6 +100,10 @@ JSON API under `/api` with cookie sessions. Highlights:
 - `POST /api/entries/:id/audio` (multipart; fields: `file`, `language` (`dene`|`english`),
   `speaker`, `recording_notes`), `GET /api/audio/:id/stream`,
   `POST /api/audio/:id/replace`, `PATCH/DELETE /api/audio/:id`
+- Public (no session): `POST /api/requests/start` (emails a form link),
+  `GET/POST /api/requests/form/:token` (the form; POST is multipart with up to 5 `files`)
+- Superadmin: `GET /api/requests`, `GET/DELETE /api/requests/:id`,
+  `GET /api/requests/files/:id/download`
 
 Audio uploads accept WAV, MP3, and M4A up to 500 MB; corrupt or unreadable files are
 rejected with a clear message and the entry is left unchanged.

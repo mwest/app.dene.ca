@@ -59,6 +59,13 @@ function fmtHours(seconds) {
   return ((seconds || 0) / 3600).toFixed(2);
 }
 
+function fmtBytes(bytes) {
+  bytes = bytes || 0;
+  return bytes >= 1024 * 1024
+    ? `${(bytes / 1024 / 1024).toFixed(1)} MB`
+    : `${Math.max(1, Math.ceil(bytes / 1024))} KB`;
+}
+
 function fmtDate(sqlite) {
   if (!sqlite) return '';
   // SQLite datetime('now') is UTC
@@ -225,6 +232,7 @@ function renderTopbar() {
   bar.hidden = false;
   $('#user-menu-btn').textContent = `${state.me.user.name} ▾`;
   $('#nav-users').hidden = !state.me.user.is_superadmin;
+  $('#nav-jobs').hidden = !state.me.user.is_superadmin;
   $('#topbar nav a[data-nav="entries"]').hidden = isTranslator();
 
   const sw = $('#project-switcher');
@@ -323,6 +331,7 @@ function renderLogin() {
         </form>
       </div>
       <p class="login-note">Accounts are created by your project admin.<br>
+      Looking for a Dene translation? <a href="#/request">Submit a request</a>.<br>
       Dene Voice Project · dene.ca</p>
     </div>`;
   $('#login-form').addEventListener('submit', async (e) => {
@@ -408,6 +417,206 @@ function renderSetPassword(token) {
       } catch (err) { showFormError(f, err.message); }
     });
   })();
+}
+
+// ---------------------------------------------------------------------------
+// Public translation request views (work without a session)
+// ---------------------------------------------------------------------------
+
+function renderRequestStart() {
+  renderTopbar();
+  view.innerHTML = `
+    <div class="login-wrap">
+      <div class="brand-big">🪶 Dene Voice Library</div>
+      <div class="card">
+        <form id="request-start-form">
+          <p>Looking for a Dene translation? Enter your email and we’ll send you a
+            link to a short request form.</p>
+          <label class="field"><span>Email</span>
+            <input type="email" name="email" required autocomplete="email" autofocus></label>
+          <p class="error-msg" hidden></p>
+          <button type="submit" style="width:100%">Send me the form</button>
+          <p style="text-align:center;margin:12px 0 0"><a href="#/" style="font-size:0.9rem">Back to sign in</a></p>
+        </form>
+      </div>
+    </div>`;
+  $('#request-start-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    try {
+      const r = await api('/requests/start', { method: 'POST', body: { email: f.email.value } });
+      f.innerHTML = r.sent
+        ? `<p>We sent a link to <b>${esc(f.email.value)}</b> — it’s valid for 7 days.
+            Check your spam folder if you don’t see it.</p>
+           <p style="text-align:center;margin:12px 0 0"><a href="#/">Back to sign in</a></p>`
+        : `<p>We couldn’t send the email right now — please try again later.</p>
+           <p style="text-align:center;margin:12px 0 0"><a href="#/">Back to sign in</a></p>`;
+    } catch (err) { showFormError(f, err.message); }
+  });
+}
+
+function renderRequestForm(token) {
+  renderTopbar();
+  view.innerHTML = `
+    <div class="request-wrap">
+      <div class="brand-big">🪶 Dene Voice Library</div>
+      <div class="card" id="request-card"><p>Checking your link…</p></div>
+    </div>`;
+  (async () => {
+    let info;
+    try { info = await api('/requests/form/' + token); }
+    catch (err) {
+      $('#request-card').innerHTML = `<p>${esc(err.message)}</p>
+        <p><a href="#/request">Request a fresh link</a>.</p>`;
+      return;
+    }
+    if (info.status === 'submitted') {
+      $('#request-card').innerHTML = `<p>This request has already been submitted —
+        thank you! We’ll be in touch at <b>${esc(info.email)}</b>.</p>`;
+      return;
+    }
+    $('#request-card').innerHTML = `
+      <form id="request-form">
+        <h2 style="margin-top:0">Translation request</h2>
+        <label class="field"><span>Name</span>
+          <input type="text" name="name" required value="${esc(info.name ?? '')}" autofocus></label>
+        <label class="field"><span>Email</span>
+          <input type="email" name="email" value="${esc(info.email)}" readonly
+            style="background:var(--bg);color:var(--muted)"></label>
+        <label class="field"><span>Dene dialect required</span>
+          <input type="text" name="dialect" required value="${esc(info.dialect ?? '')}"
+            placeholder="e.g. Dëne Sųłıné, Tłı̨chǫ, North Slavey"></label>
+        <label class="field"><span>Details of your request</span>
+          <textarea name="details" required rows="6"
+            placeholder="What do you need translated? Include any deadlines or context.">${esc(info.details ?? '')}</textarea></label>
+        <label class="field"><span>Files (optional — up to 5, max 100 MB each)</span>
+          <input type="file" name="files" multiple
+            accept=".pdf,.doc,.docx,.txt,.rtf,.csv,.xlsx,.jpg,.jpeg,.png,.heic,.mp3,.wav,.m4a,.mp4,.mov,.zip"></label>
+        <p class="error-msg" hidden></p>
+        <button type="submit" id="request-submit" style="width:100%">Submit request</button>
+      </form>`;
+    $('#request-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const f = e.target;
+      if (f.files.files.length > 5) {
+        showFormError(f, 'You can attach at most 5 files');
+        return;
+      }
+      const fd = new FormData();
+      fd.append('name', f.name.value);
+      fd.append('dialect', f.dialect.value);
+      fd.append('details', f.details.value);
+      for (const file of f.files.files) fd.append('files', file);
+      const btn = $('#request-submit');
+      btn.disabled = true;
+      btn.textContent = 'Submitting…';
+      try {
+        await api('/requests/form/' + token, { method: 'POST', body: fd });
+        $('#request-card').innerHTML = `<p><b>Request submitted — mahsi cho!</b></p>
+          <p>We’ll review it and get back to you at <b>${esc(info.email)}</b>.</p>`;
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = 'Submit request';
+        showFormError(f, err.message);
+      }
+    });
+  })();
+}
+
+// ---------------------------------------------------------------------------
+// Translation jobs (superadmin)
+// ---------------------------------------------------------------------------
+
+const jobStatusBadge = (s) =>
+  s === 'submitted' ? '<span class="badge audio">Submitted</span>'
+                    : '<span class="badge">Awaiting form</span>';
+
+async function renderJobs() {
+  setActiveNav('jobs');
+  view.innerHTML = `<div class="empty">Loading…</div>`;
+  let data;
+  try { data = await api('/requests'); }
+  catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+
+  view.innerHTML = `
+    <div class="page-head"><h1>Translation jobs</h1></div>
+    <div class="card">
+      ${data.requests.length ? `
+      <table>
+        <thead><tr><th>Received</th><th>Name</th><th>Email</th><th>Dialect</th><th>Files</th><th>Status</th></tr></thead>
+        <tbody>
+          ${data.requests.map((r) => `
+            <tr class="job-row" data-id="${r.id}">
+              <td>${fmtDate(r.submitted_at ?? r.created_at)}</td>
+              <td>${esc(r.name ?? '—')}</td>
+              <td>${esc(r.email)}</td>
+              <td>${esc(r.dialect ?? '—')}</td>
+              <td>${r.file_count}</td>
+              <td>${jobStatusBadge(r.status)}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>` : `<div class="empty">No translation requests yet.<br>
+        The public request form is linked from the sign-in page.</div>`}
+    </div>`;
+
+  view.onclick = (e) => {
+    const row = e.target.closest('tr.job-row');
+    if (row) location.hash = `#/jobs/${row.dataset.id}`;
+  };
+}
+
+async function renderJobDetail(id) {
+  setActiveNav('jobs');
+  view.innerHTML = `<div class="empty">Loading…</div>`;
+  let job;
+  try { job = await api(`/requests/${id}`); }
+  catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+
+  const field = (label, value) =>
+    `<div class="job-field"><div class="job-label">${label}</div><div>${value}</div></div>`;
+
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>Translation job #${job.id}</h1>
+      <a class="btn secondary" href="#/jobs">‹ Back to jobs</a>
+    </div>
+    <div class="card">
+      <div class="entry-meta" style="margin-bottom:0.8rem">
+        ${jobStatusBadge(job.status)}
+        <span>requested ${fmtDate(job.created_at)}</span>
+        ${job.submitted_at ? `<span>submitted ${fmtDate(job.submitted_at)}</span>` : ''}
+      </div>
+      ${field('Name', esc(job.name ?? '—'))}
+      ${field('Email', `<a href="mailto:${esc(job.email)}">${esc(job.email)}</a>`)}
+      ${field('Dene dialect required', esc(job.dialect ?? '—'))}
+      ${field('Details of the request', `<div class="job-details">${esc(job.details ?? '—')}</div>`)}
+    </div>
+    <div class="card">
+      <h2 style="margin-top:0">Files (${job.files.length})</h2>
+      ${job.files.length ? job.files.map((f) => `
+        <div class="audio-item">
+          <div class="audio-item-head">
+            <span class="fname">${esc(f.original_name)}</span>
+            <span style="color:var(--muted);font-size:0.85rem">
+              ${fmtBytes(f.size_bytes)} ·
+              <a href="/api/requests/files/${f.id}/download?dl=1">Download</a></span>
+          </div>
+          ${f.mime_type.startsWith('audio/')
+            ? `<audio controls preload="none" src="/api/requests/files/${f.id}/download"></audio>` : ''}
+        </div>`).join('') : '<p style="color:var(--muted)">No files attached.</p>'}
+    </div>
+    <div class="form-actions">
+      <button class="danger" id="delete-job">Delete request</button>
+    </div>`;
+
+  $('#delete-job').addEventListener('click', async () => {
+    if (!confirm('Delete this translation request and its files? This cannot be undone.')) return;
+    try {
+      await api(`/requests/${job.id}`, { method: 'DELETE' });
+      toast('Request deleted');
+      location.hash = '#/jobs';
+    } catch (err) { toast(err.message, true); }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1559,6 +1768,8 @@ function route() {
   // Views that work without a session:
   if ((m = hash.match(/^#\/set-password\/([a-f0-9]{64})$/))) { renderSetPassword(m[1]); return; }
   if (hash === '#/forgot') { renderForgot(); return; }
+  if (hash === '#/request') { renderRequestStart(); return; }
+  if ((m = hash.match(/^#\/request\/([a-f0-9]{64})$/))) { renderRequestForm(m[1]); return; }
   if (!state.me) { renderLogin(); return; }
   if (isTranslator()) {
     // Translators see only their dashboard and the recording session.
@@ -1572,6 +1783,8 @@ function route() {
   else if ((m = hash.match(/^#\/entries\/(\d+)$/))) renderEntryDetail(m[1]);
   else if (hash === '#/dashboard') renderDashboard();
   else if (hash === '#/users' && state.me.user.is_superadmin) renderUsers();
+  else if (hash === '#/jobs' && state.me.user.is_superadmin) renderJobs();
+  else if ((m = hash.match(/^#\/jobs\/(\d+)$/)) && state.me.user.is_superadmin) renderJobDetail(m[1]);
   else if ((m = hash.match(/^#\/projects\/(\d+)\/members$/))) renderMembers(m[1]);
   else { location.hash = '#/entries'; }
 }
@@ -1579,8 +1792,8 @@ function route() {
 window.addEventListener('hashchange', route);
 
 (async function boot() {
-  // Public views (set-password, forgot) must render even with no session.
-  const publicView = /^#\/(set-password\/|forgot$)/.test(location.hash);
+  // Public views (set-password, forgot, request) must render even with no session.
+  const publicView = /^#\/(set-password\/|forgot$|request)/.test(location.hash);
   try {
     await loadMe();
     route();

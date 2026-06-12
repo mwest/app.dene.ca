@@ -5,8 +5,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parseFile } from 'music-metadata';
 
-import db, { AUDIO_DIR, roleIn, projectsFor, projectIdsFor } from './db.js';
-import { APP_URL, inviteEmail, resetEmail, sendMail } from './mail.js';
+import db, { AUDIO_DIR, REQUESTS_DIR, roleIn, projectsFor, projectIdsFor } from './db.js';
+import { APP_URL, inviteEmail, requestFormEmail, requestNotifyEmail, resetEmail, sendMail } from './mail.js';
 import {
   COOKIE_NAME,
   cookieOptions,
@@ -111,6 +111,161 @@ api.post('/password/reset', (req, res) => {
   db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(password), t.user_id);
   db.prepare('DELETE FROM password_tokens WHERE user_id = ?').run(t.user_id);
   db.prepare('DELETE FROM sessions WHERE user_id = ?').run(t.user_id);
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// Public translation requests — email -> tokened form -> superadmin inbox
+// ---------------------------------------------------------------------------
+
+const REQUEST_LINK_HOURS = 7 * 24;
+
+// Light in-memory rate limit; protects the public email-sending endpoint.
+const rateBuckets = new Map();
+function rateLimited(key, max, windowMs) {
+  const now = Date.now();
+  const hits = (rateBuckets.get(key) ?? []).filter((t) => now - t < windowMs);
+  if (hits.length >= max) { rateBuckets.set(key, hits); return true; }
+  hits.push(now);
+  rateBuckets.set(key, hits);
+  return false;
+}
+
+const pruneExpiredRequests = () =>
+  db.prepare(
+    `DELETE FROM translation_requests WHERE status = 'invited' AND expires_at < datetime('now')`
+  ).run();
+
+// Step 1: requester enters their email and gets a unique form link.
+api.post('/requests/start', async (req, res) => {
+  const email = String(req.body?.email ?? '').trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return bad(res, 'A valid email is required');
+  if (rateLimited(`req-ip:${req.ip}`, 30, 60 * 60 * 1000) ||
+      rateLimited(`req-email:${email.toLowerCase()}`, 3, 60 * 60 * 1000)) {
+    return bad(res, 'Too many requests — please try again later', 429);
+  }
+  pruneExpiredRequests();
+  const token = crypto.randomBytes(32).toString('hex');
+  // A repeat ask from the same email refreshes the pending link instead of
+  // piling up rows.
+  const existing = db
+    .prepare(`SELECT id FROM translation_requests WHERE email = ? AND status = 'invited'`)
+    .get(email);
+  if (existing) {
+    db.prepare(
+      `UPDATE translation_requests SET token_hash = ?,
+         expires_at = datetime('now', '+${REQUEST_LINK_HOURS} hours') WHERE id = ?`
+    ).run(hashToken(token), existing.id);
+  } else {
+    db.prepare(
+      `INSERT INTO translation_requests (token_hash, email, expires_at)
+       VALUES (?, ?, datetime('now', '+${REQUEST_LINK_HOURS} hours'))`
+    ).run(hashToken(token), email);
+  }
+  const link = `${APP_URL}/#/request/${token}`;
+  const { sent } = await sendMail({ to: email, ...requestFormEmail({ link }) });
+  const out = { ok: true, sent };
+  if (process.env.NODE_ENV !== 'production') out.form_link = link; // dev/test convenience
+  res.json(out);
+});
+
+function loadRequestByToken(req, res, next) {
+  if (!/^[a-f0-9]{64}$/.test(String(req.params.token))) {
+    return bad(res, 'This link is invalid or has expired', 404);
+  }
+  const row = db
+    .prepare(
+      `SELECT * FROM translation_requests WHERE token_hash = ?
+         AND (status = 'submitted' OR expires_at >= datetime('now'))`
+    )
+    .get(hashToken(req.params.token));
+  if (!row) return bad(res, 'This link is invalid or has expired', 404);
+  req.request = row;
+  next();
+}
+
+// Step 2a: the form page loads its state (email is fixed server-side).
+api.get('/requests/form/:token', loadRequestByToken, (req, res) => {
+  const { email, name, dialect, details, status } = req.request;
+  res.json({ email, name, dialect, details, status });
+});
+
+const REQUEST_EXTS = new Set([
+  '.pdf', '.doc', '.docx', '.txt', '.rtf', '.csv', '.xlsx',
+  '.jpg', '.jpeg', '.png', '.heic',
+  '.mp3', '.wav', '.m4a', '.mp4', '.mov', '.zip',
+]);
+const MAX_REQUEST_FILE_BYTES = 100 * 1024 * 1024;
+const MAX_REQUEST_FILES = 5;
+
+const requestUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      const dir = path.join(REQUESTS_DIR, String(req.request.id));
+      fs.mkdirSync(dir, { recursive: true });
+      cb(null, dir);
+    },
+    filename: (req, file, cb) =>
+      cb(null, `${crypto.randomBytes(16).toString('hex')}${path.extname(file.originalname).toLowerCase()}`),
+  }),
+  limits: { fileSize: MAX_REQUEST_FILE_BYTES, files: MAX_REQUEST_FILES },
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (!REQUEST_EXTS.has(ext)) {
+      return cb(new Error(`Unsupported file type (${ext || 'no extension'})`));
+    }
+    cb(null, true);
+  },
+});
+
+// Step 2b: submit the form (multipart, up to 5 files), then notify superadmins.
+api.post('/requests/form/:token', loadRequestByToken, (req, res, next) => {
+  if (req.request.status === 'submitted') {
+    return bad(res, 'This request has already been submitted');
+  }
+  requestUpload.array('files', MAX_REQUEST_FILES)(req, res, (err) => {
+    if (err) {
+      const msg =
+        err.code === 'LIMIT_FILE_SIZE' ? 'Each file must be under 100 MB'
+        : err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE'
+          ? `You can attach at most ${MAX_REQUEST_FILES} files`
+        : err.message || 'Upload failed';
+      return bad(res, msg);
+    }
+    next();
+  });
+}, async (req, res) => {
+  const name = String(req.body?.name ?? '').trim();
+  const dialect = String(req.body?.dialect ?? '').trim();
+  const details = String(req.body?.details ?? '').trim();
+  if (!name || !dialect || !details) {
+    for (const f of req.files ?? []) fs.rm(f.path, { force: true }, () => {});
+    return bad(res, 'Name, dialect, and request details are required');
+  }
+
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE translation_requests SET name = ?, dialect = ?, details = ?,
+         status = 'submitted', submitted_at = datetime('now') WHERE id = ?`
+    ).run(name, dialect, details, req.request.id);
+    const ins = db.prepare(
+      `INSERT INTO request_files (request_id, stored_name, original_name, mime_type, size_bytes)
+       VALUES (?, ?, ?, ?, ?)`
+    );
+    for (const f of req.files ?? []) {
+      ins.run(req.request.id, `${req.request.id}/${f.filename}`, f.originalname,
+              f.mimetype || 'application/octet-stream', f.size);
+    }
+  })();
+
+  const mail = requestNotifyEmail({
+    name, email: req.request.email, dialect, details,
+    fileCount: (req.files ?? []).length,
+    link: `${APP_URL}/#/jobs/${req.request.id}`,
+  });
+  for (const admin of db.prepare('SELECT email FROM users WHERE is_superadmin = 1').all()) {
+    await sendMail({ to: admin.email, ...mail });
+  }
   res.json({ ok: true });
 });
 
@@ -396,6 +551,62 @@ api.delete('/users/:id', requireSuperadmin, (req, res) => {
     );
   }
   db.prepare('DELETE FROM users WHERE id = ?').run(user.id); // memberships/sessions cascade
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// Translation jobs (superadmin) — review submitted public requests
+// ---------------------------------------------------------------------------
+
+api.get('/requests', requireSuperadmin, (req, res) => {
+  pruneExpiredRequests();
+  const requests = db
+    .prepare(
+      `SELECT r.id, r.email, r.name, r.dialect, r.status, r.submitted_at, r.created_at,
+              (SELECT COUNT(*) FROM request_files f WHERE f.request_id = r.id) AS file_count
+       FROM translation_requests r
+       ORDER BY COALESCE(r.submitted_at, r.created_at) DESC, r.id DESC`
+    )
+    .all();
+  res.json({ requests });
+});
+
+// More specific than /requests/:id below, so register it first.
+api.get('/requests/files/:id/download', requireSuperadmin, (req, res) => {
+  const f = db.prepare('SELECT * FROM request_files WHERE id = ?').get(req.params.id);
+  if (!f) return bad(res, 'File not found', 404);
+  // Uploaded content is untrusted: only audio may render inline (for the
+  // in-app player); everything else downloads as an opaque attachment so a
+  // crafted HTML/SVG file can never execute on this origin.
+  const inline = f.mime_type.startsWith('audio/') && !req.query.dl;
+  res.sendFile(path.join(REQUESTS_DIR, f.stored_name), {
+    headers: {
+      'Content-Type': inline ? f.mime_type : 'application/octet-stream',
+      'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(f.original_name)}`,
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
+});
+
+api.get('/requests/:id', requireSuperadmin, (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return bad(res, 'Not found', 404);
+  const request = db.prepare('SELECT * FROM translation_requests WHERE id = ?').get(req.params.id);
+  if (!request) return bad(res, 'Request not found', 404);
+  const files = db
+    .prepare(
+      `SELECT id, original_name, mime_type, size_bytes, created_at
+       FROM request_files WHERE request_id = ? ORDER BY id`
+    )
+    .all(request.id);
+  const { token_hash, ...rest } = request;
+  res.json({ ...rest, files });
+});
+
+api.delete('/requests/:id', requireSuperadmin, (req, res) => {
+  const request = db.prepare('SELECT * FROM translation_requests WHERE id = ?').get(req.params.id);
+  if (!request) return bad(res, 'Request not found', 404);
+  db.prepare('DELETE FROM translation_requests WHERE id = ?').run(request.id); // files cascade
+  fs.rm(path.join(REQUESTS_DIR, String(request.id)), { recursive: true, force: true }, () => {});
   res.json({ ok: true });
 });
 

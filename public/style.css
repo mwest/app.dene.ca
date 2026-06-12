@@ -186,12 +186,27 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .char-palette button:hover { background: var(--accent); color: #fff; }
 .palette-hint { font-size: 0.78rem; color: var(--muted); margin: 0.1rem 0 0.3rem; }
 
+/* ---- Translation requests / jobs ---- */
+.request-wrap { max-width: 560px; margin: 5vh auto 0; }
+tr.job-row { cursor: pointer; }
+tr.job-row:hover td { background: var(--accent-soft); }
+.job-field { margin-bottom: 0.9rem; }
+.job-label { font-size: 0.85rem; font-weight: 600; color: var(--muted); margin-bottom: 0.25rem; }
+.job-details {
+  white-space: pre-wrap;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.8rem 1rem;
+}
+
 /* ---- Login ---- */
 .login-wrap {
   max-width: 400px;
   margin: 8vh auto 0;
 }
-.login-wrap .brand-big {
+.login-wrap .brand-big,
+.request-wrap .brand-big {
   text-align: center;
   font-size: 1.4rem;
   font-weight: 700;

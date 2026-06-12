@@ -41,6 +41,11 @@ const wrap = (body) => `
       Dene Voice Project · dene.ca — if you weren’t expecting this email you can ignore it.</p>
   </div>`;
 
+// User-provided values rendered into HTML email bodies must be escaped.
+const escHtml = (s) =>
+  String(s ?? '').replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
 export function inviteEmail({ name, link, invitedBy, projectName }) {
   const intro = projectName
     ? `${invitedBy} added you to the <b>${projectName}</b> project on the Dene Voice Library.`
@@ -51,6 +56,35 @@ export function inviteEmail({ name, link, invitedBy, projectName }) {
     html: wrap(`<p>Hi ${name},</p><p>${intro}</p>
       <p><a href="${link}" style="background:#1f4e5f;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none">Set your password</a></p>
       <p style="color:#666;font-size:13px">This link is valid for 7 days. Or paste this URL into your browser:<br>${link}</p>`),
+  };
+}
+
+export function requestFormEmail({ link }) {
+  return {
+    subject: 'Your Dene translation request form',
+    text: `Thanks for your interest in a Dene translation!\n\nFill out your request here (link valid for 7 days):\n${link}\n\nIf you didn’t ask for this, you can ignore this email.\n`,
+    html: wrap(`<p>Thanks for your interest in a Dene translation!</p>
+      <p><a href="${link}" style="background:#1f4e5f;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none">Fill out your request</a></p>
+      <p style="color:#666;font-size:13px">This link is valid for 7 days. Or paste this URL into your browser:<br>${link}</p>`),
+  };
+}
+
+export function requestNotifyEmail({ name, email, dialect, details, fileCount, link }) {
+  const oneLine = String(name).replace(/\s+/g, ' ').trim();
+  const cell = (label, value) =>
+    `<tr><td style="padding:2px 12px 2px 0;color:#666;vertical-align:top">${label}</td><td>${value}</td></tr>`;
+  return {
+    subject: `New translation request from ${oneLine}`,
+    text: `A new translation request was submitted.\n\nName: ${oneLine}\nEmail: ${email}\nDialect: ${dialect}\nFiles: ${fileCount}\n\nDetails:\n${details}\n\nView it in the app:\n${link}\n`,
+    html: wrap(`<p>A new translation request was submitted.</p>
+      <table style="font-size:14px;border-collapse:collapse">
+        ${cell('Name', escHtml(oneLine))}
+        ${cell('Email', escHtml(email))}
+        ${cell('Dialect', escHtml(dialect))}
+        ${cell('Files', String(fileCount))}
+      </table>
+      <p style="white-space:pre-wrap;border-left:3px solid #ddd;padding-left:12px;color:#333">${escHtml(details)}</p>
+      <p><a href="${link}" style="background:#1f4e5f;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none">Open in Translation Jobs</a></p>`),
   };
 }
 

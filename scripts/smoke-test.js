@@ -212,7 +212,7 @@ r = await member.req('GET', `/api/entries/${entryId}`);
 check('member has one dene + one english', r.status === 200 && r.data.audio.length === 2 &&
   new Set(r.data.audio.map((a) => a.language)).size === 2, JSON.stringify(r.data?.audio));
 
-// recordings are private to their contributor (admins see all)
+// every project member sees and can stream all recordings on the project's entries
 const member2Email = `member2-${Date.now()}@test.ca`;
 await sa.req('POST', `/api/projects/${projectId}/members`,
   { email: member2Email, name: 'Second Member', password: 'member2-pass-1' });
@@ -227,15 +227,15 @@ check('second member records own dene clip', r.status === 201, JSON.stringify(r.
 const member2AudioId = r.data?.id;
 
 r = await member2.req('GET', `/api/entries/${entryId}`);
-check('member2 sees only their own recording', r.status === 200 && r.data.audio.length === 1 &&
-  r.data.audio[0].id === member2AudioId, JSON.stringify(r.data?.audio));
+check('member2 sees all recordings on the entry', r.status === 200 && r.data.audio.length === 3 &&
+  r.data.audio.some((a) => a.id === member2AudioId), JSON.stringify(r.data?.audio));
 
 r = await member.req('GET', `/api/entries/${entryId}`);
-check('member1 still sees only their own recordings', r.status === 200 && r.data.audio.length === 2 &&
-  r.data.audio.every((a) => a.id !== member2AudioId), JSON.stringify(r.data?.audio));
+check("member1 sees member2's recording too", r.status === 200 && r.data.audio.length === 3 &&
+  r.data.audio.some((a) => a.id === member2AudioId), JSON.stringify(r.data?.audio));
 
 r = await member2.req('GET', `/api/audio/${audioId}/stream`);
-check("member cannot stream another member's recording", r.status === 403);
+check("member streams another member's recording", r.status === 200);
 
 r = await sa.req('GET', `/api/entries/${entryId}`);
 check('admin sees all recordings', r.status === 200 && r.data.audio.length === 3,
@@ -406,6 +406,86 @@ check('delete account without contributions', r.status === 200);
 
 r = await sa.req('DELETE', `/api/users/${memberId}`);
 check('account with contributions cannot be deleted', r.status === 400, JSON.stringify(r.data));
+
+// --- public translation requests ---
+const requesterEmail = `requester${Date.now()}@test.ca`;
+const anon = client();
+
+r = await anon.req('POST', '/api/requests/start', { email: 'not-an-email' });
+check('request start rejects invalid email', r.status === 400);
+
+r = await anon.req('POST', '/api/requests/start', { email: requesterEmail });
+check('request start issues form link (dev exposes it)', r.status === 200 &&
+  typeof r.data.form_link === 'string', JSON.stringify(r.data));
+const requestToken = r.data.form_link.split('/').pop();
+
+r = await anon.req('GET', `/api/requests/form/${'0'.repeat(64)}`);
+check('bogus form token rejected', r.status === 404);
+
+r = await anon.req('GET', `/api/requests/form/${requestToken}`);
+check('form preloads with fixed email', r.status === 200 &&
+  r.data.email === requesterEmail && r.data.status === 'invited', JSON.stringify(r.data));
+
+fd = new FormData();
+fd.append('name', 'Pat Requester');
+r = await anon.req('POST', `/api/requests/form/${requestToken}`, fd, true);
+check('form requires name, dialect, details', r.status === 400);
+
+fd = new FormData();
+fd.append('name', 'Pat Requester');
+fd.append('dialect', 'Tłı̨chǫ');
+fd.append('details', 'Please translate the attached ceremony program.');
+for (let i = 0; i < 6; i++) {
+  fd.append('files', new Blob(['x'], { type: 'text/plain' }), `f${i}.txt`);
+}
+r = await anon.req('POST', `/api/requests/form/${requestToken}`, fd, true);
+check('more than 5 files rejected', r.status === 400 && /at most 5/.test(r.data.error),
+  JSON.stringify(r.data));
+
+fd = new FormData();
+fd.append('name', 'Pat Requester');
+fd.append('dialect', 'Tłı̨chǫ');
+fd.append('details', 'Please translate the attached ceremony program.');
+fd.append('files', new Blob([makeWav(1)], { type: 'audio/wav' }), 'sample.wav');
+fd.append('files', new Blob(['program text'], { type: 'text/plain' }), 'program.txt');
+r = await anon.req('POST', `/api/requests/form/${requestToken}`, fd, true);
+check('request form submits with 2 files', r.status === 200, JSON.stringify(r.data));
+
+r = await anon.req('GET', `/api/requests/form/${requestToken}`);
+check('form reports submitted', r.status === 200 && r.data.status === 'submitted');
+
+fd = new FormData();
+fd.append('name', 'Pat Again');
+fd.append('dialect', 'x');
+fd.append('details', 'y');
+r = await anon.req('POST', `/api/requests/form/${requestToken}`, fd, true);
+check('resubmission rejected', r.status === 400);
+
+r = await member.req('GET', '/api/requests');
+check('non-superadmin cannot list translation jobs', r.status === 403);
+
+r = await sa.req('GET', '/api/requests');
+const job = r.data?.requests?.find((x) => x.email === requesterEmail);
+check('superadmin lists translation jobs', r.status === 200 && job &&
+  job.status === 'submitted' && job.file_count === 2, JSON.stringify(r.data?.requests?.[0]));
+
+r = await sa.req('GET', `/api/requests/${job.id}`);
+check('job detail has fields and files', r.status === 200 && r.data.name === 'Pat Requester' &&
+  r.data.dialect === 'Tłı̨chǫ' && r.data.files.length === 2, JSON.stringify(r.data));
+const txtFile = r.data.files.find((f) => f.original_name === 'program.txt');
+
+r = await sa.req('GET', `/api/requests/files/${txtFile.id}/download`);
+check('superadmin downloads request file (forced attachment)', r.status === 200 &&
+  /attachment/.test(r.headers.get('content-disposition') ?? ''),
+  r.headers.get('content-disposition'));
+
+r = await anon.req('GET', `/api/requests/files/${txtFile.id}/download`);
+check('public cannot download request files', r.status === 401);
+
+r = await sa.req('DELETE', `/api/requests/${job.id}`);
+check('superadmin deletes translation job', r.status === 200);
+r = await sa.req('GET', `/api/requests/${job.id}`);
+check('deleted job is gone', r.status === 404);
 
 // --- project editing (superadmin) ---
 r = await member.req('PATCH', `/api/projects/${projectId}`, { name: 'Hacked' });
