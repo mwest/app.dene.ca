@@ -744,18 +744,17 @@ function renderNewEntry() {
   const ap = activeProject();
 
   view.innerHTML = `
-    <div class="page-head"><h1>New entry</h1></div>
+    <div class="page-head">
+      <h1>New entry</h1>
+      <span class="page-context">${esc(ap.name)}${ap.dialect ? ` — ${esc(ap.dialect)}` : ''}</span>
+    </div>
     <div class="card">
       <form id="entry-form">
-        <label class="field"><span>Project (dialect)</span>
-          <select name="project_id">
-            ${projects.map((p) => `<option value="${p.id}" ${p.id === ap?.id ? 'selected' : ''}>${esc(p.name)}${p.dialect ? ` — ${esc(p.dialect)}` : ''}</option>`).join('')}
-          </select></label>
         <label class="field"><span>Dene text</span>
-          <textarea name="dene_text" id="dene-input" class="dene" required lang="den" spellcheck="false"></textarea></label>
+          <input type="text" name="dene_text" id="dene-input" class="dene" required lang="den" spellcheck="false"></label>
         ${palette('#dene-input')}
         <label class="field"><span>English text</span>
-          <textarea name="english_text" required></textarea></label>
+          <input type="text" name="english_text" required></label>
         <div class="form-row">
           <label class="field"><span>Category (optional)</span>
             <input type="text" name="category" placeholder="e.g. greetings, animals, weather"></label>
@@ -779,7 +778,7 @@ function renderNewEntry() {
       const entry = await api('/entries', {
         method: 'POST',
         body: {
-          project_id: Number(f.project_id.value),
+          project_id: ap.id,
           dene_text: f.dene_text.value,
           english_text: f.english_text.value,
           category: f.category.value,
@@ -787,7 +786,6 @@ function renderNewEntry() {
           notes: f.notes.value,
         },
       });
-      setActiveProject(f.project_id.value);
       toast('Entry created — you can add audio now');
       location.hash = `#/entries/${entry.id}`;
     } catch (err) { showFormError(f, err.message); }
