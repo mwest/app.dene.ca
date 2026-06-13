@@ -636,7 +636,7 @@ async function renderEntries() {
 
   view.innerHTML = `
     <div class="page-head">
-      <h1>Entries</h1>
+      <h1>Dictionary</h1>
       <a class="btn" href="#/entries/new">＋ New entry</a>
     </div>
     <div class="filters">
@@ -817,7 +817,7 @@ async function renderEntryDetail(id) {
   view.innerHTML = `
     <div class="page-head">
       <h1>Entry #${entry.id}</h1>
-      <a class="btn secondary" href="#/entries">‹ Back to entries</a>
+      <a class="btn secondary" href="#/entries">‹ Back to dictionary</a>
     </div>
     <div class="card">
       <form id="entry-form">
