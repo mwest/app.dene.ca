@@ -41,7 +41,7 @@ body {
 }
 .brand { font-weight: 700; font-size: 1.05rem; white-space: nowrap; }
 .brand-mark { margin-right: 0.25rem; }
-#topbar nav { display: flex; gap: 0.25rem; }
+#topbar nav { display: flex; gap: 0.25rem; flex-wrap: wrap; }
 #topbar nav a {
   text-decoration: none;
   color: var(--ink);
@@ -410,6 +410,10 @@ tr.job-row:hover td { background: var(--accent-soft); }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 0.55rem 0.6rem; border-bottom: 1px solid var(--line); }
 th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+/* Wide admin tables scroll within their card on narrow screens instead of
+   stretching the whole page past the viewport. */
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.table-wrap table { min-width: 520px; }
 
 /* ---- Modal ---- */
 .modal-backdrop {

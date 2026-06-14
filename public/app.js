@@ -542,7 +542,7 @@ async function renderJobs() {
     <div class="page-head"><h1>Translation jobs</h1></div>
     <div class="card">
       ${data.requests.length ? `
-      <table>
+      <div class="table-wrap"><table>
         <thead><tr><th>Received</th><th>Name</th><th>Email</th><th>Dialect</th><th>Files</th><th>Status</th></tr></thead>
         <tbody>
           ${data.requests.map((r) => `
@@ -555,7 +555,7 @@ async function renderJobs() {
               <td>${jobStatusBadge(r.status)}</td>
             </tr>`).join('')}
         </tbody>
-      </table>` : `<div class="empty">No translation requests yet.<br>
+      </table></div>` : `<div class="empty">No translation requests yet.<br>
         The public request form is linked from the sign-in page.</div>`}
     </div>`;
 
@@ -1556,7 +1556,7 @@ async function renderMembers(projectId) {
       <a class="btn secondary" href="#/dashboard">‹ Back to dashboard</a>
     </div>
     <div class="card">
-      <table>
+      <div class="table-wrap"><table>
         <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Entries</th><th>Added</th><th></th></tr></thead>
         <tbody>
           ${data.members.map((mb) => `
@@ -1570,7 +1570,7 @@ async function renderMembers(projectId) {
                 `<button class="danger small" data-remove="${mb.id}">Remove</button>`}</td>
             </tr>`).join('') || '<tr><td colspan="6" style="color:var(--muted)">No members yet.</td></tr>'}
         </tbody>
-      </table>
+      </table></div>
     </div>
     <div class="card">
       <h2 style="margin-top:0">Add a member</h2>
@@ -1650,7 +1650,7 @@ async function renderUsers() {
       <button id="new-user-btn">＋ New account</button>
     </div>
     <div class="card">
-      <table>
+      <div class="table-wrap"><table>
         <thead><tr><th>Name</th><th>Email</th><th>Projects</th><th>Entries</th><th>Recordings</th><th>Created</th><th></th></tr></thead>
         <tbody>
           ${data.users.map((u) => `
@@ -1670,7 +1670,7 @@ async function renderUsers() {
               </td>
             </tr>`).join('')}
         </tbody>
-      </table>
+      </table></div>
       <p style="color:var(--muted);font-size:0.85rem;margin-bottom:0">
         Accounts with contributions can't be deleted (attribution is preserved) — remove them
         from their projects instead, which revokes all access. Project membership is managed
