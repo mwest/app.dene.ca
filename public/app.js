@@ -234,6 +234,7 @@ function renderTopbar() {
   $('#nav-users').hidden = !state.me.user.is_superadmin;
   $('#nav-jobs').hidden = !state.me.user.is_superadmin;
   $('#topbar nav a[data-nav="entries"]').hidden = isTranslator();
+  $('#topbar nav a[data-nav="phrases"]').hidden = isTranslator();
 
   const sw = $('#project-switcher');
   const projects = state.me.projects;
@@ -623,10 +624,17 @@ async function renderJobDetail(id) {
 // Entries list view
 // ---------------------------------------------------------------------------
 
-const listState = { q: '', has_audio: '', contributor: '', status: '', offset: 0 };
+const listState = { kind: 'word', q: '', has_audio: '', contributor: '', status: '', incomplete: '', offset: 0 };
 
-async function renderEntries() {
-  setActiveNav('entries');
+async function renderEntries(kind = 'word') {
+  const isPhrase = kind === 'phrase';
+  setActiveNav(isPhrase ? 'phrases' : 'entries');
+  // Switching between Dictionary and Phrases starts with a clean filter set.
+  if (listState.kind !== kind) {
+    Object.assign(listState, { q: '', has_audio: '', contributor: '', status: '', incomplete: '', offset: 0 });
+  }
+  listState.kind = kind;
+
   const projects = state.me.projects;
   if (!projects.length) {
     view.innerHTML = `<div class="empty">You are not a member of any project yet.<br>
@@ -636,8 +644,8 @@ async function renderEntries() {
 
   view.innerHTML = `
     <div class="page-head">
-      <h1>Dictionary</h1>
-      <a class="btn" href="#/entries/new">＋ New entry</a>
+      <h1>${isPhrase ? 'Phrases' : 'Dictionary'}</h1>
+      <a class="btn" href="#/${isPhrase ? 'phrases' : 'entries'}/new">＋ New ${isPhrase ? 'phrase' : 'entry'}</a>
     </div>
     <div class="filters">
       <input type="search" id="f-q" placeholder="Search Dene or English text…" value="${esc(listState.q)}">
@@ -646,6 +654,12 @@ async function renderEntries() {
         <option value="yes" ${listState.has_audio === 'yes' ? 'selected' : ''}>Has audio</option>
         <option value="no" ${listState.has_audio === 'no' ? 'selected' : ''}>No audio</option>
       </select>
+      ${isPhrase ? `
+      <select id="f-incomplete">
+        <option value="">Translation: any</option>
+        <option value="yes" ${listState.incomplete === 'yes' ? 'selected' : ''}>Needs translation</option>
+        <option value="done" ${listState.incomplete === 'done' ? 'selected' : ''}>Complete</option>
+      </select>` : ''}
       <select id="f-contributor"><option value="">All contributors</option></select>
       <select id="f-status">
         <option value="">Status: any</option>
@@ -664,8 +678,8 @@ async function renderEntries() {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => { listState.q = e.target.value; listState.offset = 0; loadEntryList(); }, 250);
   });
-  for (const [id, key] of [['#f-audio', 'has_audio'], ['#f-contributor', 'contributor'], ['#f-status', 'status']]) {
-    $(id).addEventListener('change', (e) => { listState[key] = e.target.value; listState.offset = 0; loadEntryList(); });
+  for (const [id, key] of [['#f-audio', 'has_audio'], ['#f-contributor', 'contributor'], ['#f-status', 'status'], ['#f-incomplete', 'incomplete']]) {
+    $(id)?.addEventListener('change', (e) => { listState[key] = e.target.value; listState.offset = 0; loadEntryList(); });
   }
 
   await loadEntryList();
@@ -690,10 +704,13 @@ async function loadEntryList() {
   const params = new URLSearchParams();
   const ap = activeProject();
   if (ap) params.set('project_id', String(ap.id));
+  params.set('kind', listState.kind);
   if (listState.q) params.set('q', listState.q);
   if (listState.has_audio) params.set('has_audio', listState.has_audio);
   if (listState.contributor) params.set('contributor', listState.contributor);
   if (listState.status) params.set('status', listState.status);
+  if (listState.incomplete === 'yes') params.set('complete', 'no');
+  else if (listState.incomplete === 'done') params.set('complete', 'yes');
   params.set('limit', '50');
   params.set('offset', String(listState.offset));
 
@@ -702,24 +719,28 @@ async function loadEntryList() {
   catch (err) { listEl.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
 
   if (!data.entries.length) {
-    listEl.innerHTML = `<div class="empty">No entries found.</div>`;
+    listEl.innerHTML = `<div class="empty">No ${listState.kind === 'phrase' ? 'phrases' : 'entries'} found.</div>`;
     $('#pager').innerHTML = '';
     return;
   }
 
-  listEl.innerHTML = data.entries.map((e) => `
+  listEl.innerHTML = data.entries.map((e) => {
+    const incomplete = e.kind === 'phrase' && (!e.dene_text || !e.english_text);
+    return `
     <a class="entry-row" href="#/entries/${e.id}">
-      <div class="dene">${esc(e.dene_text)}</div>
-      <div class="english">${esc(e.english_text)}</div>
+      <div class="dene">${esc(e.dene_text) || '<span class="placeholder">— no Dene yet —</span>'}</div>
+      <div class="english">${esc(e.english_text) || '<span class="placeholder">— no English yet —</span>'}</div>
       <div class="entry-meta">
         <span class="badge">${esc(e.project_name)}</span>
+        ${incomplete ? '<span class="badge incomplete">Needs translation</span>' : ''}
         ${e.category ? `<span class="badge">${esc(e.category)}</span>` : ''}
         ${e.audio_count ? `<span class="badge audio">♪ ${e.audio_count} · ${fmtDuration(e.audio_seconds)}</span>` : ''}
         ${e.status !== 'draft' ? `<span class="badge status-${e.status}">${e.status}</span>` : ''}
         <span>by ${esc(e.created_by_name)}</span>
         <span>updated ${fmtDate(e.updated_at)}</span>
       </div>
-    </a>`).join('');
+    </a>`;
+  }).join('');
 
   const pager = $('#pager');
   const page = Math.floor(listState.offset / 50) + 1;
@@ -737,24 +758,30 @@ async function loadEntryList() {
 // New entry view
 // ---------------------------------------------------------------------------
 
-function renderNewEntry() {
-  setActiveNav('entries');
+function renderNewEntry(kind = 'word') {
+  const isPhrase = kind === 'phrase';
+  const backHref = isPhrase ? '#/phrases' : '#/entries';
+  setActiveNav(isPhrase ? 'phrases' : 'entries');
   const projects = state.me.projects;
-  if (!projects.length) { location.hash = '#/entries'; return; }
+  if (!projects.length) { location.hash = backHref; return; }
   const ap = activeProject();
 
+  // Words require both sides; phrases need at least one (the other can be filled
+  // in later — it'll be flagged as needing translation).
+  const req = isPhrase ? '' : 'required';
   view.innerHTML = `
     <div class="page-head">
-      <h1>New entry</h1>
+      <h1>New ${isPhrase ? 'phrase' : 'entry'}</h1>
       <span class="page-context">${esc(ap.name)}${ap.dialect ? ` — ${esc(ap.dialect)}` : ''}</span>
     </div>
     <div class="card">
       <form id="entry-form">
-        <label class="field"><span>Dene text</span>
-          <input type="text" name="dene_text" id="dene-input" class="dene" required lang="den" spellcheck="false"></label>
+        ${isPhrase ? '<p class="form-hint">Enter a Dene phrase, an English meaning, or both. If you enter only one, it will be queued for translation.</p>' : ''}
+        <label class="field"><span>${isPhrase ? 'Dene phrase' : 'Dene text'}</span>
+          <input type="text" name="dene_text" id="dene-input" class="dene" ${req} lang="den" spellcheck="false"></label>
         ${palette('#dene-input')}
-        <label class="field"><span>English text</span>
-          <input type="text" name="english_text" required></label>
+        <label class="field"><span>${isPhrase ? 'English meaning' : 'English text'}</span>
+          <input type="text" name="english_text" ${req}></label>
         <div class="form-row">
           <label class="field"><span>Category (optional)</span>
             <input type="text" name="category" placeholder="e.g. greetings, animals, weather"></label>
@@ -765,8 +792,8 @@ function renderNewEntry() {
         </div>
         <p class="error-msg" hidden></p>
         <div class="form-actions">
-          <button type="submit">Create entry</button>
-          <a class="btn secondary" href="#/entries">Cancel</a>
+          <button type="submit">Create ${isPhrase ? 'phrase' : 'entry'}</button>
+          <a class="btn secondary" href="${backHref}">Cancel</a>
         </div>
       </form>
     </div>`;
@@ -774,11 +801,16 @@ function renderNewEntry() {
   $('#entry-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const f = e.target;
+    if (isPhrase && !f.dene_text.value.trim() && !f.english_text.value.trim()) {
+      showFormError(f, 'Enter a Dene phrase, an English meaning, or both');
+      return;
+    }
     try {
       const entry = await api('/entries', {
         method: 'POST',
         body: {
           project_id: ap.id,
+          kind,
           dene_text: f.dene_text.value,
           english_text: f.english_text.value,
           category: f.category.value,
@@ -786,7 +818,7 @@ function renderNewEntry() {
           notes: f.notes.value,
         },
       });
-      toast('Entry created — you can add audio now');
+      toast(`${isPhrase ? 'Phrase' : 'Entry'} created${isPhrase && (!entry.dene_text || !entry.english_text) ? ' — queued for translation' : ' — you can add audio now'}`);
       location.hash = `#/entries/${entry.id}`;
     } catch (err) { showFormError(f, err.message); }
   });
@@ -797,12 +829,15 @@ function renderNewEntry() {
 // ---------------------------------------------------------------------------
 
 async function renderEntryDetail(id) {
-  setActiveNav('entries');
   view.innerHTML = `<div class="empty">Loading…</div>`;
   let entry;
   try { entry = await api(`/entries/${id}`); }
   catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
 
+  const isPhrase = entry.kind === 'phrase';
+  const incomplete = isPhrase && (!entry.dene_text || !entry.english_text);
+  const backHref = isPhrase ? '#/phrases' : '#/entries';
+  setActiveNav(isPhrase ? 'phrases' : 'entries');
   const ro = !entry.can_edit;
   const isAdmin = entry.role === 'admin';
   const myId = state.me.user.id;
@@ -812,47 +847,12 @@ async function renderEntryDetail(id) {
   };
   const others = entry.audio.filter((a) => a.uploaded_by !== myId);
 
-  view.innerHTML = `
-    <div class="page-head">
-      <h1>Entry #${entry.id}</h1>
-      <a class="btn secondary" href="#/entries">‹ Back to dictionary</a>
-    </div>
+  // An incomplete phrase can't be recorded yet — show a prompt instead of slots.
+  const recordingsCard = incomplete ? `
     <div class="card">
-      <form id="entry-form">
-        <div class="entry-meta" style="margin-bottom:0.8rem">
-          <span class="badge">${esc(entry.project_name)}${entry.dialect ? ` — ${esc(entry.dialect)}` : ''}</span>
-          <span>created by ${esc(entry.created_by_name)} on ${fmtDate(entry.created_at)}</span>
-          <span>last edited by ${esc(entry.updated_by_name)} on ${fmtDate(entry.updated_at)}</span>
-        </div>
-        <div class="entry-texts">
-          <label class="field"><span>Dene text</span>
-            <textarea name="dene_text" id="dene-input" class="dene" required lang="den" spellcheck="false" ${ro ? 'readonly' : ''}>${esc(entry.dene_text)}</textarea></label>
-          <label class="field"><span>English text</span>
-            <textarea name="english_text" required ${ro ? 'readonly' : ''}>${esc(entry.english_text)}</textarea></label>
-        </div>
-        ${ro ? '' : palette('#dene-input')}
-        <div class="form-row">
-          <label class="field"><span>Category</span>
-            <input type="text" name="category" value="${esc(entry.category ?? '')}" ${ro ? 'readonly' : ''} placeholder="e.g. greetings, animals"></label>
-          <label class="field"><span>Source document</span>
-            <input type="text" name="source_doc" value="${esc(entry.source_doc ?? '')}" ${ro ? 'readonly' : ''}></label>
-          <label class="field"><span>Notes</span>
-            <input type="text" name="notes" value="${esc(entry.notes ?? '')}" ${ro ? 'readonly' : ''}></label>
-          <label class="field"><span>Review status</span>
-            <select name="status" ${isAdmin ? '' : 'disabled'}>
-              ${['draft', 'reviewed', 'verified'].map((s) =>
-                `<option value="${s}" ${entry.status === s ? 'selected' : ''}>${s}</option>`).join('')}
-            </select></label>
-        </div>
-        <p class="error-msg" hidden></p>
-        ${ro ? '' : `
-        <div class="form-actions">
-          <button type="submit">Save changes</button>
-          <button type="button" class="danger" id="delete-entry">Delete entry</button>
-        </div>`}
-      </form>
-    </div>
-
+      <h2 style="margin-top:0">Recordings</h2>
+      <p class="form-hint">Add the translation above before recording this phrase.</p>
+    </div>` : `
     <div class="card">
       <h2 style="margin-top:0">Your recordings</h2>
       <div class="audio-slots" id="audio-slots">
@@ -882,6 +882,50 @@ async function renderEntryDetail(id) {
       </details>
     </div>`;
 
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>${isPhrase ? 'Phrase' : 'Entry'} #${entry.id}</h1>
+      <a class="btn secondary" href="${backHref}">‹ Back to ${isPhrase ? 'phrases' : 'dictionary'}</a>
+    </div>
+    <div class="card">
+      <form id="entry-form">
+        <div class="entry-meta" style="margin-bottom:0.8rem">
+          <span class="badge">${esc(entry.project_name)}${entry.dialect ? ` — ${esc(entry.dialect)}` : ''}</span>
+          ${incomplete ? '<span class="badge incomplete">Needs translation</span>' : ''}
+          <span>created by ${esc(entry.created_by_name)} on ${fmtDate(entry.created_at)}</span>
+          <span>last edited by ${esc(entry.updated_by_name)} on ${fmtDate(entry.updated_at)}</span>
+        </div>
+        <div class="entry-texts">
+          <label class="field"><span>${isPhrase ? 'Dene phrase' : 'Dene text'}</span>
+            <textarea name="dene_text" id="dene-input" class="dene" ${isPhrase ? '' : 'required'} lang="den" spellcheck="false" ${ro ? 'readonly' : ''}>${esc(entry.dene_text)}</textarea></label>
+          <label class="field"><span>${isPhrase ? 'English meaning' : 'English text'}</span>
+            <textarea name="english_text" ${isPhrase ? '' : 'required'} ${ro ? 'readonly' : ''}>${esc(entry.english_text)}</textarea></label>
+        </div>
+        ${ro ? '' : palette('#dene-input')}
+        <div class="form-row">
+          <label class="field"><span>Category</span>
+            <input type="text" name="category" value="${esc(entry.category ?? '')}" ${ro ? 'readonly' : ''} placeholder="e.g. greetings, animals"></label>
+          <label class="field"><span>Source document</span>
+            <input type="text" name="source_doc" value="${esc(entry.source_doc ?? '')}" ${ro ? 'readonly' : ''}></label>
+          <label class="field"><span>Notes</span>
+            <input type="text" name="notes" value="${esc(entry.notes ?? '')}" ${ro ? 'readonly' : ''}></label>
+          <label class="field"><span>Review status</span>
+            <select name="status" ${isAdmin ? '' : 'disabled'}>
+              ${['draft', 'reviewed', 'verified'].map((s) =>
+                `<option value="${s}" ${entry.status === s ? 'selected' : ''}>${s}</option>`).join('')}
+            </select></label>
+        </div>
+        <p class="error-msg" hidden></p>
+        ${ro ? '' : `
+        <div class="form-actions">
+          <button type="submit">Save changes</button>
+          <button type="button" class="danger" id="delete-entry">Delete ${isPhrase ? 'phrase' : 'entry'}</button>
+        </div>`}
+      </form>
+    </div>
+
+    ${recordingsCard}`;
+
   // --- entry save/delete ---
   $('#entry-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -897,25 +941,25 @@ async function renderEntryDetail(id) {
       };
       if (isAdmin) body.status = f.status.value;
       await api(`/entries/${entry.id}`, { method: 'PATCH', body });
-      toast('Entry saved');
+      toast(isPhrase ? 'Phrase saved' : 'Entry saved');
       renderEntryDetail(entry.id);
     } catch (err) { showFormError(f, err.message); }
   });
 
   $('#delete-entry')?.addEventListener('click', async () => {
-    if (!confirm('Delete this entry and all its audio recordings? This cannot be undone.')) return;
+    if (!confirm(`Delete this ${isPhrase ? 'phrase' : 'entry'} and all its audio recordings? This cannot be undone.`)) return;
     try {
       await api(`/entries/${entry.id}`, { method: 'DELETE' });
-      toast('Entry deleted');
-      location.hash = '#/entries';
+      toast(isPhrase ? 'Phrase deleted' : 'Entry deleted');
+      location.hash = backHref;
     } catch (err) { toast(err.message, true); }
   });
 
-  // --- microphone recording ---
-  setupRecorder(entry);
+  // --- microphone recording (only when the recording slots are present) ---
+  if (!incomplete) setupRecorder(entry);
 
   // --- audio upload ---
-  $('#audio-form').addEventListener('submit', async (e) => {
+  $('#audio-form')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const f = e.target;
     const fd = new FormData();
@@ -938,7 +982,7 @@ async function renderEntryDetail(id) {
   });
 
   // --- per-audio actions (event delegation) ---
-  $('#audio-list').addEventListener('click', async (e) => {
+  $('#audio-list')?.addEventListener('click', async (e) => {
     const btn = e.target.closest('button[data-action]');
     if (!btn) return;
     const audioId = btn.dataset.id;
@@ -1107,7 +1151,7 @@ async function renderTranslatorDashboard() {
     </div>`;
   $('#start-session').addEventListener('click', () => { location.hash = '#/record'; });
   try {
-    const data = await api(`/entries?project_id=${p.id}&has_audio=no&limit=1`);
+    const data = await api(`/entries?project_id=${p.id}&has_audio=no&complete=yes&limit=1`);
     $('#queue-count').textContent = data.total === 0
       ? 'Every entry has a recording — check back later.'
       : `${data.total} ${data.total === 1 ? 'entry needs' : 'entries need'} a recording.`;
@@ -1127,7 +1171,7 @@ async function renderRecordSession() {
   if (!p) { location.hash = '#/dashboard'; return; }
   view.innerHTML = `<div class="empty">Loading…</div>`;
   let data;
-  try { data = await api(`/entries?project_id=${p.id}&has_audio=no&limit=200`); }
+  try { data = await api(`/entries?project_id=${p.id}&has_audio=no&complete=yes&limit=200`); }
   catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
   recSession.queue = data.entries;
   recSession.pos = 0;
@@ -1776,8 +1820,10 @@ function route() {
     else location.hash = '#/dashboard';
     return;
   }
-  if (hash === '#/entries') renderEntries();
-  else if (hash === '#/entries/new') renderNewEntry();
+  if (hash === '#/entries') renderEntries('word');
+  else if (hash === '#/entries/new') renderNewEntry('word');
+  else if (hash === '#/phrases') renderEntries('phrase');
+  else if (hash === '#/phrases/new') renderNewEntry('phrase');
   else if ((m = hash.match(/^#\/entries\/(\d+)$/))) renderEntryDetail(m[1]);
   else if (hash === '#/dashboard') renderDashboard();
   else if (hash === '#/users' && state.me.user.is_superadmin) renderUsers();

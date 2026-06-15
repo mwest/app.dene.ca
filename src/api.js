@@ -693,6 +693,18 @@ api.get('/entries', (req, res) => {
     where.push('e.status = ?');
     params.push(String(req.query.status));
   }
+  if (req.query.kind === 'word' || req.query.kind === 'phrase') {
+    where.push('e.kind = ?');
+    params.push(req.query.kind);
+  }
+  // A complete entry has both sides filled. Words always are; phrases may have
+  // one side blank ('') until translated. The recording queue passes this so
+  // incomplete phrases aren't offered for recording.
+  if (req.query.complete === 'yes') {
+    where.push("e.dene_text <> '' AND e.english_text <> ''");
+  } else if (req.query.complete === 'no') {
+    where.push("(e.dene_text = '' OR e.english_text = '')");
+  }
 
   const whereSql = `WHERE ${where.join(' AND ')}`;
   const total = db
@@ -736,15 +748,22 @@ api.post('/entries', (req, res) => {
   if (role === 'translator') {
     return bad(res, 'Translators add recordings, not entries', 403);
   }
-  if (!dene_text?.trim() || !english_text?.trim()) {
+  const kind = req.body?.kind === 'phrase' ? 'phrase' : 'word';
+  const dene = dene_text?.trim() || '';
+  const english = english_text?.trim() || '';
+  // Words need both sides; a phrase needs at least one (the missing side is
+  // stored as '' and the phrase is flagged incomplete until translated).
+  if (kind === 'phrase') {
+    if (!dene && !english) return bad(res, 'Enter a Dene phrase, an English meaning, or both');
+  } else if (!dene || !english) {
     return bad(res, 'Both Dene text and English text are required');
   }
   const info = db
     .prepare(
-      `INSERT INTO entries (project_id, dene_text, english_text, source_doc, notes, category, created_by, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO entries (project_id, kind, dene_text, english_text, source_doc, notes, category, created_by, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .run(projectId, dene_text.trim(), english_text.trim(), source_doc?.trim() || null,
+    .run(projectId, kind, dene, english, source_doc?.trim() || null,
          notes?.trim() || null, category?.trim() || null, req.user.id, req.user.id);
   const entry = db
     .prepare(`${entrySelect} WHERE e.id = ?`)
@@ -768,8 +787,16 @@ api.get('/entries/:id', loadEntry, (req, res) => {
 api.patch('/entries/:id', loadEntry, (req, res) => {
   if (!canEditEntry(req)) return bad(res, 'You can only edit your own entries', 403);
   const { dene_text, english_text, source_doc, notes, category, status } = req.body ?? {};
-  if (dene_text !== undefined && !dene_text.trim()) return bad(res, 'Dene text cannot be empty');
-  if (english_text !== undefined && !english_text.trim()) return bad(res, 'English text cannot be empty');
+  // Resolve the resulting two sides, then enforce the per-kind rule: words need
+  // both; phrases need at least one (an emptied side is stored as '').
+  const nextDene = dene_text !== undefined ? dene_text.trim() : req.entry.dene_text;
+  const nextEnglish = english_text !== undefined ? english_text.trim() : req.entry.english_text;
+  if (req.entry.kind === 'phrase') {
+    if (!nextDene && !nextEnglish) return bad(res, 'A phrase must keep a Dene phrase or an English meaning');
+  } else {
+    if (!nextDene) return bad(res, 'Dene text cannot be empty');
+    if (!nextEnglish) return bad(res, 'English text cannot be empty');
+  }
   if (status !== undefined) {
     if (req.projectRole !== 'admin') return bad(res, 'Only project admins can change review status', 403);
     if (!['draft', 'reviewed', 'verified'].includes(status)) return bad(res, 'Invalid status');
@@ -780,8 +807,8 @@ api.patch('/entries/:id', loadEntry, (req, res) => {
        updated_by = ?, updated_at = datetime('now')
      WHERE id = ?`
   ).run(
-    dene_text !== undefined ? dene_text.trim() : req.entry.dene_text,
-    english_text !== undefined ? english_text.trim() : req.entry.english_text,
+    nextDene,
+    nextEnglish,
     source_doc !== undefined ? (source_doc?.trim() || null) : req.entry.source_doc,
     notes !== undefined ? (notes?.trim() || null) : req.entry.notes,
     category !== undefined ? (category?.trim() || null) : req.entry.category,
@@ -862,6 +889,11 @@ async function probeAudio(filePath) {
 api.post('/entries/:id/audio', loadEntry, audioUpload, async (req, res) => {
   if (!req.file) return bad(res, 'No audio file provided');
   const filePath = req.file.path;
+  // Can't record an incomplete phrase — it must be translated first.
+  if (req.entry.kind === 'phrase' && (req.entry.dene_text === '' || req.entry.english_text === '')) {
+    fs.rm(filePath, { force: true }, () => {});
+    return bad(res, 'Add the translation before recording this phrase');
+  }
   const language = req.body.language === 'english' ? 'english' : 'dene';
   let duration;
   try {
@@ -956,7 +988,7 @@ api.delete('/audio/:id', loadAudio, (req, res) => {
 api.get('/projects/:id/export', requireProjectAdmin, (req, res) => {
   const rows = db
     .prepare(
-      `SELECT e.id, e.dene_text, e.english_text, e.source_doc, e.notes, e.category, e.status,
+      `SELECT e.id, e.kind, e.dene_text, e.english_text, e.source_doc, e.notes, e.category, e.status,
               cu.name AS contributor, e.created_at, e.updated_at
        FROM entries e JOIN users cu ON cu.id = e.created_by
        WHERE e.project_id = ? ORDER BY e.id`
@@ -988,11 +1020,11 @@ api.get('/projects/:id/export', requireProjectAdmin, (req, res) => {
       const s = String(v);
       return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
-    const header = 'entry_id,dene_text,english_text,category,source_doc,notes,status,contributor,created_at,updated_at,dene_audio_files,english_audio_files,audio_duration_seconds\n';
+    const header = 'entry_id,kind,dene_text,english_text,category,source_doc,notes,status,contributor,created_at,updated_at,dene_audio_files,english_audio_files,audio_duration_seconds\n';
     const lines = rows.map((r) => {
       const audio = audioByEntry.get(r.id) ?? [];
       return [
-        r.id, r.dene_text, r.english_text, r.category, r.source_doc, r.notes, r.status,
+        r.id, r.kind, r.dene_text, r.english_text, r.category, r.source_doc, r.notes, r.status,
         r.contributor, r.created_at, r.updated_at,
         audio.filter((a) => a.language === 'dene').map((a) => a.file).join(';'),
         audio.filter((a) => a.language === 'english').map((a) => a.file).join(';'),

@@ -368,6 +368,65 @@ fd.append('file', new Blob(['not,a,csv'], { type: 'text/plain' }), 'data.json');
 r = await sa.req('POST', `/api/projects/${projectId}/import`, fd, true);
 check('non-CSV file rejected', r.status === 400);
 
+// --- phrases (entries with kind='phrase'; one side may be blank → incomplete) ---
+// Created and cleaned up here so the project's entry/recording counts are
+// unchanged for the deletion assertions below.
+r = await member.req('POST', '/api/entries', { project_id: projectId, kind: 'phrase', dene_text: 'sǫǫ', english_text: '' });
+check('phrase with only Dene (incomplete)', r.status === 201 && r.data.kind === 'phrase' && r.data.english_text === '', JSON.stringify(r.data));
+const phraseDeneOnly = r.data?.id;
+
+r = await member.req('POST', '/api/entries', { project_id: projectId, kind: 'phrase', dene_text: '', english_text: 'hello there' });
+check('phrase with only English (incomplete)', r.status === 201 && r.data.dene_text === '', JSON.stringify(r.data));
+const phraseEngOnly = r.data?.id;
+
+r = await member.req('POST', '/api/entries', { project_id: projectId, kind: 'phrase', dene_text: 'edǝ', english_text: 'good morning' });
+check('phrase with both sides (complete)', r.status === 201 && r.data.kind === 'phrase', JSON.stringify(r.data));
+const phraseBoth = r.data?.id;
+
+r = await member.req('POST', '/api/entries', { project_id: projectId, kind: 'phrase' });
+check('phrase with neither side rejected', r.status === 400);
+
+r = await member.req('POST', '/api/entries', { project_id: projectId, dene_text: 'lonely', english_text: '' });
+check('word still requires both sides', r.status === 400);
+
+r = await member.req('GET', `/api/entries?project_id=${projectId}&kind=phrase`);
+check('kind=phrase returns only phrases', r.status === 200 && r.data.total >= 3 &&
+  r.data.entries.every((e) => e.kind === 'phrase'), JSON.stringify(r.data.total));
+
+r = await member.req('GET', `/api/entries?project_id=${projectId}&kind=word`);
+check('kind=word excludes phrases', r.status === 200 && r.data.entries.every((e) => e.kind === 'word'));
+
+r = await member.req('GET', `/api/entries?project_id=${projectId}&kind=phrase&has_audio=no&complete=yes`);
+check('recordable queue includes complete phrase, excludes incomplete', r.status === 200 &&
+  r.data.entries.some((e) => e.id === phraseBoth) && !r.data.entries.some((e) => e.id === phraseDeneOnly),
+  JSON.stringify(r.data.entries.map((e) => e.id)));
+
+fd = new FormData();
+fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'p.wav');
+fd.append('language', 'dene');
+r = await member.req('POST', `/api/entries/${phraseEngOnly}/audio`, fd, true);
+check('audio rejected on incomplete phrase', r.status === 400, JSON.stringify(r.data));
+
+r = await member.req('PATCH', `/api/entries/${phraseEngOnly}`, { dene_text: 'sası̨ı̨' });
+check('completing a phrase via edit', r.status === 200 && r.data.dene_text === 'sası̨ı̨');
+
+fd = new FormData();
+fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'p2.wav');
+fd.append('language', 'dene');
+r = await member.req('POST', `/api/entries/${phraseEngOnly}/audio`, fd, true);
+check('audio accepted once phrase is complete', r.status === 201, JSON.stringify(r.data));
+
+r = await member.req('PATCH', `/api/entries/${phraseBoth}`, { dene_text: '', english_text: '' });
+check('cannot blank both sides of a phrase', r.status === 400);
+
+r = await translator.req('POST', '/api/entries', { project_id: projectId, kind: 'phrase', english_text: 'nope' });
+check('translator cannot create phrases', r.status === 403);
+
+// clean up the phrases (and their cascade-deleted audio) to keep counts stable
+for (const pid of [phraseDeneOnly, phraseEngOnly, phraseBoth]) {
+  await member.req('DELETE', `/api/entries/${pid}`);
+}
+
 // --- removal: immediate access loss, attribution kept ---
 r = await sa.req('DELETE', `/api/projects/${projectId}/members/${memberId}`);
 check('admin removes member', r.status === 200);

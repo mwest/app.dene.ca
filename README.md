@@ -48,6 +48,23 @@ the queue. Project admins assign the role from the project's **Members** page.
 Removing a member takes effect immediately (membership is checked on every request);
 their past contributions remain attributed to them.
 
+## Dictionary & Phrases
+
+Entries come in two kinds, distinguished by a `kind` column (`word` | `phrase`)
+on the shared `entries` table — they share all the same machinery (recording,
+review status, search, audio, export). The **Dictionary** tab lists words; the
+**Phrases** tab lists phrases.
+
+The one behavioural difference: a **dictionary word requires both the Dene and
+English sides**, while a **phrase may be saved with only one side** (the other
+left blank). A one-sided phrase is flagged **"Needs translation"** and is
+completed later from its normal edit screen — there's no separate translation
+workflow. Once both sides are present, the phrase behaves like any entry and
+flows into the **same recording queue** as words (an incomplete phrase is held
+out of the queue and can't be recorded until it's translated). Filter the
+Phrases list by translation state with the "Needs translation / Complete"
+selector.
+
 ## Recording audio
 
 Each entry shows two recording slots per user: **Dene** and **English**. Click record,

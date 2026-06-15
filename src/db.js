@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS memberships (
 CREATE TABLE IF NOT EXISTS entries (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id   INTEGER NOT NULL REFERENCES projects(id),
+  kind         TEXT NOT NULL DEFAULT 'word' CHECK (kind IN ('word', 'phrase')),
   dene_text    TEXT NOT NULL,
   english_text TEXT NOT NULL,
   source_doc   TEXT,
@@ -131,6 +132,13 @@ if (!audioCols.includes('language')) {
 const entryCols = db.prepare(`PRAGMA table_info(entries)`).all().map((c) => c.name);
 if (!entryCols.includes('category')) {
   db.exec(`ALTER TABLE entries ADD COLUMN category TEXT`);
+}
+
+// Migration: entry kind ('word' or 'phrase'). Existing rows are dictionary
+// words. ALTER can't carry the CHECK constraint, so the allowed values are
+// enforced in the API; new databases get the CHECK from the CREATE TABLE above.
+if (!entryCols.includes('kind')) {
+  db.exec(`ALTER TABLE entries ADD COLUMN kind TEXT NOT NULL DEFAULT 'word'`);
 }
 
 // Migration: 'translator' membership role. SQLite cannot alter a CHECK

@@ -261,6 +261,9 @@ tr.job-row:hover td { background: var(--accent-soft); }
 .badge.audio { background: #e3efe6; color: var(--good); }
 .badge.status-reviewed { background: #fdf0dd; color: var(--warn); }
 .badge.status-verified { background: #e3efe6; color: var(--good); }
+.badge.incomplete { background: #fae3da; color: var(--danger); }
+.entry-row .placeholder { color: var(--muted); font-style: italic; font-weight: 400; }
+.form-hint { color: var(--muted); font-size: 0.9rem; margin: 0 0 0.8rem; }
 
 .pager { display: flex; gap: 0.6rem; align-items: center; justify-content: center; margin-top: 1rem; }
 .empty { text-align: center; color: var(--muted); padding: 2.5rem 0; }
