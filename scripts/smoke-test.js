@@ -249,6 +249,7 @@ const translatorEmail = `translator${Date.now()}@test.ca`;
 r = await sa.req('POST', `/api/projects/${projectId}/members`,
   { email: translatorEmail, name: 'Test Translator', password: 'translator-pass-1', role: 'translator' });
 check('admin creates translator account', r.status === 201, JSON.stringify(r.data));
+const translatorId = r.data.user_id;
 
 const translator = client();
 r = await translator.req('POST', '/api/login', { email: translatorEmail, password: 'translator-pass-1' });
@@ -484,6 +485,83 @@ check('translate rejected on a dictionary word', r.status === 400);
 for (const pid of [phraseDeneOnly, phraseEngOnly, phraseBoth]) {
   await member.req('DELETE', `/api/entries/${pid}`);
 }
+
+// --- compensation (self-contained in its own project) ---
+r = await sa.req('POST', '/api/projects', { name: pname + ' Comp' });
+const compProj = r.data.id;
+await sa.req('POST', `/api/projects/${compProj}/members`, { email: translatorEmail, role: 'translator' });
+
+r = await sa.req('PUT', `/api/compensation/${translatorId}/rates`, { project_id: compProj, type: 'translation', rate_cents: 200 });
+check('superadmin sets translation rate', r.status === 200, JSON.stringify(r.data));
+await sa.req('PUT', `/api/compensation/${translatorId}/rates`, { project_id: compProj, type: 'recording', rate_cents: 150 });
+r = await sa.req('PUT', `/api/compensation/${translatorId}/rates`, { project_id: compProj, type: 'recording', rate_cents: 175 });
+check('superadmin can change a rate', r.status === 200);
+
+r = await sa.req('POST', '/api/entries', { project_id: compProj, dene_text: 'kǫ', english_text: 'fire' });
+const compWord = r.data.id;
+r = await sa.req('POST', '/api/entries', { project_id: compProj, kind: 'phrase', english_text: 'good morning' });
+const compPhrase = r.data.id;
+
+fd = new FormData();
+fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'comp.wav');
+fd.append('language', 'dene');
+r = await translator.req('POST', `/api/entries/${compWord}/audio`, fd, true);
+check('translator records in comp project', r.status === 201);
+
+fd = new FormData();
+fd.append('file', new Blob([makeWav(2)], { type: 'audio/wav' }), 'comp2.wav');
+fd.append('language', 'dene');
+r = await translator.req('POST', `/api/entries/${compWord}/audio`, fd, true);
+check('re-record replaces without double-billing', r.status === 200 && r.data.replaced === true);
+
+r = await translator.req('POST', `/api/entries/${compPhrase}/translate`, { dene_text: 'edǝ', english_text: 'good morning' });
+check('translator translates in comp project', r.status === 200);
+
+r = await sa.req('GET', `/api/compensation/${translatorId}`);
+check('ledger uses snapshotted rates (175 recording + 200 translation)', r.status === 200 &&
+  r.data.work.filter((w) => w.type === 'recording' && w.amount_cents === 175).length === 1 &&
+  r.data.work.filter((w) => w.type === 'translation' && w.amount_cents === 200).length === 1,
+  JSON.stringify(r.data.work.map((w) => `${w.type}:${w.amount_cents}`)));
+const earnedBefore = r.data.earned_cents;
+check('balance equals earned before any payment', r.data.balance_cents === earnedBefore && r.data.paid_cents === 0);
+
+r = await sa.req('POST', `/api/compensation/${translatorId}/payments`, { amount_cents: 300, method: 'e-transfer' });
+check('recording a payment lowers the balance', r.status === 201 &&
+  r.data.paid_cents === 300 && r.data.balance_cents === earnedBefore - 300, JSON.stringify(r.data));
+
+r = await sa.req('POST', `/api/compensation/${translatorId}/adjustments`, { amount_cents: 25, note: 'rounding bonus' });
+check('a positive adjustment raises the balance', r.status === 201 &&
+  r.data.balance_cents === earnedBefore - 300 + 25, JSON.stringify(r.data));
+r = await sa.req('POST', `/api/compensation/${translatorId}/adjustments`, { amount_cents: 25 });
+check('adjustment requires a note', r.status === 400);
+
+r = await translator.req('GET', '/api/me/compensation');
+check('translator sees their own totals', r.status === 200 &&
+  r.data.balance_cents === earnedBefore - 300 + 25, JSON.stringify(r.data));
+
+r = await member.req('GET', '/api/compensation');
+check('non-superadmin cannot list compensation', r.status === 403);
+r = await member.req('PUT', `/api/compensation/${translatorId}/rates`,
+  { project_id: compProj, type: 'recording', rate_cents: 999 });
+check('non-superadmin cannot set rates', r.status === 403);
+r = await member.req('POST', `/api/compensation/${translatorId}/payments`, { amount_cents: 100 });
+check('non-superadmin cannot record payments', r.status === 403);
+
+// work logged before any rate is set is recorded at amount 0
+const tr2Email = `rateless-${Date.now()}@test.ca`;
+r = await sa.req('POST', `/api/projects/${compProj}/members`,
+  { email: tr2Email, name: 'Rateless', password: 'rateless-pass-1', role: 'translator' });
+const tr2Id = r.data.user_id;
+const tr2 = client();
+await tr2.req('POST', '/api/login', { email: tr2Email, password: 'rateless-pass-1' });
+r = await sa.req('POST', '/api/entries', { project_id: compProj, kind: 'phrase', english_text: 'goodbye' });
+r = await tr2.req('POST', `/api/entries/${r.data.id}/translate`, { dene_text: 'mahsi', english_text: 'goodbye' });
+check('unrated translator can still work', r.status === 200);
+r = await sa.req('GET', `/api/compensation/${tr2Id}`);
+check('unrated work is logged at amount 0', r.status === 200 &&
+  r.data.earned_cents === 0 && r.data.work.length === 1, JSON.stringify(r.data));
+
+await sa.req('DELETE', `/api/projects/${compProj}`, { confirm_name: pname + ' Comp' });
 
 // --- removal: immediate access loss, attribution kept ---
 r = await sa.req('DELETE', `/api/projects/${projectId}/members/${memberId}`);

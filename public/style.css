@@ -385,6 +385,11 @@ tr.job-row:hover td { background: var(--accent-soft); }
 }
 .rec-actions button { font-size: 1.05rem; padding: 0.7rem 1.5rem; }
 
+/* ---- Compensation ---- */
+.rate-field { display: inline-flex; align-items: center; gap: 0.2rem; }
+.rate-field input { width: 6rem; }
+.earnings-line { margin-top: 2rem; color: var(--muted); font-size: 0.95rem; }
+
 /* ---- Dashboard ---- */
 .stat-grid {
   display: grid;

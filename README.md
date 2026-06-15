@@ -102,6 +102,24 @@ the uploaded files viewable/downloadable. Public endpoints are rate-limited; upl
 files are always served as attachments (audio may stream inline) so untrusted content
 never executes on the app origin.
 
+## Compensation
+
+Optional tracking of translator pay (superadmin-only, under the **Compensation**
+tab). Each translator has flat **per-project rates** — one for recording, one for
+translation — that can change at any time. As translators record clips and complete
+phrase translations, each billable action is logged once into an **append-only ledger**
+with the amount **snapshotted at that moment**, so a later rate change only affects
+future work (and re-recording a clip doesn't double-bill). Work logged before a rate is
+set is recorded at $0 and can be re-priced with a manual **adjustment** (positive or
+negative, with a note).
+
+Balances **aggregate per translator** across all their projects:
+`balance = sum(work) − sum(payments)`. **Payments are recorded, not moved** — the app
+never touches money; the superadmin logs payments made offline (e-transfer, cheque, …)
+for bookkeeping. Translators see their own running *earned / paid / balance* on their
+dashboard. All amounts are stored as integer cents (CAD). Rate changes are kept in an
+audit table.
+
 ## Data layout
 
 - `data/dene.db` — SQLite database (users, sessions, projects, memberships, entries,

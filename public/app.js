@@ -59,6 +59,12 @@ function fmtHours(seconds) {
   return ((seconds || 0) / 3600).toFixed(2);
 }
 
+// Integer cents -> "$1,234.56" (negative shown as "-$1.00").
+function fmtMoney(cents) {
+  const n = (cents || 0) / 100;
+  return `${n < 0 ? '-' : ''}$${Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
 function fmtBytes(bytes) {
   bytes = bytes || 0;
   return bytes >= 1024 * 1024
@@ -233,6 +239,7 @@ function renderTopbar() {
   $('#user-menu-btn').textContent = `${state.me.user.name} ▾`;
   $('#nav-users').hidden = !state.me.user.is_superadmin;
   $('#nav-jobs').hidden = !state.me.user.is_superadmin;
+  $('#nav-compensation').hidden = !state.me.user.is_superadmin;
   $('#topbar nav a[data-nav="entries"]').hidden = isTranslator();
   $('#topbar nav a[data-nav="phrases"]').hidden = isTranslator();
 
@@ -617,6 +624,206 @@ async function renderJobDetail(id) {
       toast('Request deleted');
       location.hash = '#/jobs';
     } catch (err) { toast(err.message, true); }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Compensation (superadmin) — work ledger, per-project rates, payments
+// ---------------------------------------------------------------------------
+
+async function renderCompensation() {
+  setActiveNav('compensation');
+  view.innerHTML = `<div class="empty">Loading…</div>`;
+  let data;
+  try { data = await api('/compensation'); }
+  catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+
+  view.innerHTML = `
+    <div class="page-head"><h1>Compensation</h1></div>
+    <div class="card">
+      <p style="color:var(--muted);font-size:0.9rem;margin-top:0">
+        Work is logged automatically as translators record and translate. Payments
+        are recorded here for your own bookkeeping — the app doesn't move money.</p>
+      ${data.translators.length ? `
+      <div class="table-wrap"><table>
+        <thead><tr><th>Name</th><th>Email</th><th>Earned</th><th>Paid</th><th>Balance</th></tr></thead>
+        <tbody>
+          ${data.translators.map((t) => `
+            <tr class="job-row" data-id="${t.id}">
+              <td>${esc(t.name)}</td>
+              <td>${esc(t.email)}</td>
+              <td>${fmtMoney(t.earned_cents)}</td>
+              <td>${fmtMoney(t.paid_cents)}</td>
+              <td><b>${fmtMoney(t.balance_cents)}</b></td>
+            </tr>`).join('')}
+        </tbody>
+      </table></div>` : `<div class="empty">No translators yet.</div>`}
+    </div>`;
+
+  view.onclick = (e) => {
+    const row = e.target.closest('tr.job-row');
+    if (row) location.hash = `#/compensation/${row.dataset.id}`;
+  };
+}
+
+async function renderCompensationDetail(id) {
+  setActiveNav('compensation');
+  view.innerHTML = `<div class="empty">Loading…</div>`;
+  let d;
+  try { d = await api(`/compensation/${id}`); }
+  catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+
+  const rateOf = (projectId, type) =>
+    d.rates.find((r) => r.project_id === projectId && r.type === type)?.rate_cents;
+  const rateVal = (c) => (c === undefined ? '' : (c / 100).toFixed(2));
+
+  const workLabel = { translation: 'Translation', recording: 'Recording', adjustment: 'Adjustment' };
+
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>${esc(d.user.name)}</h1>
+      <a class="btn secondary" href="#/compensation">‹ Back to compensation</a>
+    </div>
+    <div class="card">
+      <div class="stat-numbers">
+        <div><div class="num">${fmtMoney(d.earned_cents)}</div><div class="lbl">Earned</div></div>
+        <div><div class="num">${fmtMoney(d.paid_cents)}</div><div class="lbl">Paid</div></div>
+        <div><div class="num">${fmtMoney(d.balance_cents)}</div><div class="lbl">Balance</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 style="margin-top:0">Rates per project</h2>
+      ${d.projects.length ? `
+      <div class="table-wrap"><table>
+        <thead><tr><th>Project</th><th>Translation (each)</th><th>Recording (each)</th></tr></thead>
+        <tbody>
+          ${d.projects.map((p) => `
+            <tr>
+              <td>${esc(p.name)}</td>
+              ${['translation', 'recording'].map((type) => `
+                <td><span class="rate-field">$<input type="number" min="0" step="0.01"
+                    data-project="${p.id}" data-type="${type}"
+                    value="${rateVal(rateOf(p.id, type))}" placeholder="0.00"></span></td>`).join('')}
+            </tr>`).join('')}
+        </tbody>
+      </table></div>
+      <p class="palette-hint">Changing a rate only affects work logged from then on; past earnings keep the rate they were logged at.</p>
+      ` : '<p style="color:var(--muted)">This person isn\'t a member of any project yet.</p>'}
+    </div>
+
+    <div class="card">
+      <h2 style="margin-top:0">Record a payment</h2>
+      <form id="payment-form">
+        <div class="form-row">
+          <label class="field"><span>Amount</span>
+            <input type="number" name="amount" min="0.01" step="0.01" required placeholder="0.00"></label>
+          <label class="field"><span>Date paid</span>
+            <input type="date" name="paid_on"></label>
+          <label class="field"><span>Method</span>
+            <input type="text" name="method" placeholder="e.g. e-transfer, cheque"></label>
+          <label class="field"><span>Note</span>
+            <input type="text" name="note" placeholder="optional"></label>
+        </div>
+        <p class="error-msg" hidden></p>
+        <button type="submit">Record payment</button>
+      </form>
+      <details style="margin-top:1rem">
+        <summary style="cursor:pointer;color:var(--muted)">Add a manual adjustment (bonus / correction)</summary>
+        <form id="adjust-form" style="margin-top:0.8rem">
+          <div class="form-row">
+            <label class="field"><span>Amount (use a minus sign to deduct)</span>
+              <input type="number" name="amount" step="0.01" required placeholder="0.00"></label>
+            <label class="field"><span>Reason (required)</span>
+              <input type="text" name="note" required placeholder="e.g. bonus, correction"></label>
+          </div>
+          <p class="error-msg" hidden></p>
+          <button type="submit" class="secondary">Add adjustment</button>
+        </form>
+      </details>
+    </div>
+
+    <div class="card">
+      <h2 style="margin-top:0">Work log</h2>
+      ${d.work.length ? `
+      <div class="table-wrap"><table>
+        <thead><tr><th>Date</th><th>Type</th><th>Project</th><th>Detail</th><th>Amount</th></tr></thead>
+        <tbody>
+          ${d.work.map((w) => `
+            <tr>
+              <td>${fmtDate(w.created_at)}</td>
+              <td>${workLabel[w.type] ?? w.type}</td>
+              <td>${esc(w.project_name ?? '—')}</td>
+              <td>${w.entry_id ? `<a href="#/entries/${w.entry_id}">entry #${w.entry_id}</a>` : esc(w.note ?? '')}</td>
+              <td>${fmtMoney(w.amount_cents)}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table></div>` : '<p style="color:var(--muted)">No work logged yet.</p>'}
+    </div>
+
+    <div class="card">
+      <h2 style="margin-top:0">Payments</h2>
+      ${d.payments.length ? `
+      <div class="table-wrap"><table>
+        <thead><tr><th>Date paid</th><th>Amount</th><th>Method</th><th>Note</th></tr></thead>
+        <tbody>
+          ${d.payments.map((p) => `
+            <tr>
+              <td>${esc(p.paid_on ?? fmtDate(p.created_at))}</td>
+              <td>${fmtMoney(p.amount_cents)}</td>
+              <td>${esc(p.method ?? '—')}</td>
+              <td>${esc(p.note ?? '')}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table></div>` : '<p style="color:var(--muted)">No payments recorded yet.</p>'}
+    </div>`;
+
+  // --- rate edits (save on change) ---
+  view.querySelectorAll('input[data-project]').forEach((input) => {
+    input.addEventListener('change', async () => {
+      const cents = Math.round(parseFloat(input.value || '0') * 100);
+      if (!Number.isFinite(cents) || cents < 0) { toast('Rate must be zero or more', true); return; }
+      try {
+        await api(`/compensation/${id}/rates`, {
+          method: 'PUT',
+          body: { project_id: Number(input.dataset.project), type: input.dataset.type, rate_cents: cents },
+        });
+        toast('Rate saved');
+      } catch (err) { toast(err.message, true); }
+    });
+  });
+
+  // --- record payment ---
+  $('#payment-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    try {
+      await api(`/compensation/${id}/payments`, {
+        method: 'POST',
+        body: {
+          amount_cents: Math.round(parseFloat(f.amount.value) * 100),
+          paid_on: f.paid_on.value || undefined,
+          method: f.method.value,
+          note: f.note.value,
+        },
+      });
+      toast('Payment recorded');
+      renderCompensationDetail(id);
+    } catch (err) { showFormError(f, err.message); }
+  });
+
+  // --- adjustment ---
+  $('#adjust-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    try {
+      await api(`/compensation/${id}/adjustments`, {
+        method: 'POST',
+        body: { amount_cents: Math.round(parseFloat(f.amount.value) * 100), note: f.note.value },
+      });
+      toast('Adjustment added');
+      renderCompensationDetail(id);
+    } catch (err) { showFormError(f, err.message); }
   });
 }
 
@@ -1152,13 +1359,16 @@ async function renderTranslatorDashboard() {
 
   let recTotal = 0;
   let transTotal = 0;
+  let comp = null;
   try {
-    const [rec, trans] = await Promise.all([
+    const [rec, trans, c] = await Promise.all([
       api(`/entries?project_id=${p.id}&has_audio=no&complete=yes&limit=1`),
       api(`/entries?project_id=${p.id}&kind=phrase&complete=no&limit=1`),
+      api('/me/compensation'),
     ]);
     recTotal = rec.total;
     transTotal = trans.total;
+    comp = c;
   } catch { /* counts are decorative — the session views report errors themselves */ }
 
   view.innerHTML = `
@@ -1172,9 +1382,69 @@ async function renderTranslatorDashboard() {
         ? 'Every entry has a recording — check back later.'
         : `${recTotal} ${recTotal === 1 ? 'entry needs' : 'entries need'} a recording.`}</p>
       <button class="big-action" id="start-record" ${recTotal === 0 ? 'disabled' : ''}>⏺ Start recording session</button>
+      ${comp ? `
+        <p class="earnings-line">Earned ${fmtMoney(comp.earned_cents)} · Paid ${fmtMoney(comp.paid_cents)} ·
+          <b>Balance ${fmtMoney(comp.balance_cents)}</b></p>
+        <p><a href="#/earnings">View my work log ›</a></p>` : ''}
     </div>`;
   $('#start-record').addEventListener('click', () => { location.hash = '#/record'; });
   $('#start-translate')?.addEventListener('click', () => { location.hash = '#/translate'; });
+}
+
+// A translator's own read-only work log + payments (same data the superadmin sees).
+async function renderMyEarnings() {
+  setActiveNav('dashboard');
+  view.innerHTML = `<div class="empty">Loading…</div>`;
+  let d;
+  try { d = await api('/me/compensation'); }
+  catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+  const workLabel = { translation: 'Translation', recording: 'Recording', adjustment: 'Adjustment' };
+
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>My work &amp; earnings</h1>
+      <a class="btn secondary" href="#/dashboard">‹ Back to dashboard</a>
+    </div>
+    <div class="card">
+      <div class="stat-numbers">
+        <div><div class="num">${fmtMoney(d.earned_cents)}</div><div class="lbl">Earned</div></div>
+        <div><div class="num">${fmtMoney(d.paid_cents)}</div><div class="lbl">Paid</div></div>
+        <div><div class="num">${fmtMoney(d.balance_cents)}</div><div class="lbl">Balance</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2 style="margin-top:0">Work log</h2>
+      ${d.work.length ? `
+      <div class="table-wrap"><table>
+        <thead><tr><th>Date</th><th>Type</th><th>Project</th><th>Detail</th><th>Amount</th></tr></thead>
+        <tbody>
+          ${d.work.map((w) => `
+            <tr>
+              <td>${fmtDate(w.created_at)}</td>
+              <td>${workLabel[w.type] ?? w.type}</td>
+              <td>${esc(w.project_name ?? '—')}</td>
+              <td>${w.entry_id ? `entry #${w.entry_id}` : esc(w.note ?? '')}</td>
+              <td>${fmtMoney(w.amount_cents)}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table></div>` : '<p style="color:var(--muted)">No work logged yet.</p>'}
+    </div>
+    <div class="card">
+      <h2 style="margin-top:0">Payments</h2>
+      ${d.payments.length ? `
+      <div class="table-wrap"><table>
+        <thead><tr><th>Date paid</th><th>Amount</th><th>Method</th><th>Note</th></tr></thead>
+        <tbody>
+          ${d.payments.map((p) => `
+            <tr>
+              <td>${esc(p.paid_on ?? fmtDate(p.created_at))}</td>
+              <td>${fmtMoney(p.amount_cents)}</td>
+              <td>${esc(p.method ?? '—')}</td>
+              <td>${esc(p.note ?? '')}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table></div>` : '<p style="color:var(--muted)">No payments recorded yet.</p>'}
+    </div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1953,6 +2223,7 @@ function route() {
     // translation session.
     if (hash === '#/record') renderRecordSession();
     else if (hash === '#/translate') renderTranslateSession();
+    else if (hash === '#/earnings') renderMyEarnings();
     else if (hash === '#/dashboard') renderTranslatorDashboard();
     else location.hash = '#/dashboard';
     return;
@@ -1966,6 +2237,8 @@ function route() {
   else if (hash === '#/users' && state.me.user.is_superadmin) renderUsers();
   else if (hash === '#/jobs' && state.me.user.is_superadmin) renderJobs();
   else if ((m = hash.match(/^#\/jobs\/(\d+)$/)) && state.me.user.is_superadmin) renderJobDetail(m[1]);
+  else if (hash === '#/compensation' && state.me.user.is_superadmin) renderCompensation();
+  else if ((m = hash.match(/^#\/compensation\/(\d+)$/)) && state.me.user.is_superadmin) renderCompensationDetail(m[1]);
   else if ((m = hash.match(/^#\/projects\/(\d+)\/members$/))) renderMembers(m[1]);
   else { location.hash = '#/entries'; }
 }

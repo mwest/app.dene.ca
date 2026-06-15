@@ -119,6 +119,59 @@ CREATE TABLE IF NOT EXISTS request_files (
   created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_request_files_request ON request_files(request_id);
+
+-- Translator compensation. Rates are per (translator, project, work type) and
+-- can change any time. Each billable event is logged once into work_log with
+-- the amount snapshotted at that moment, so rate changes only affect future
+-- work. Balances aggregate per translator across projects; payments record
+-- money already paid offline (the app never moves money). All amounts are
+-- integer cents (CAD).
+CREATE TABLE IF NOT EXISTS translator_rates (
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  type       TEXT NOT NULL CHECK (type IN ('translation', 'recording')),
+  rate_cents INTEGER NOT NULL,
+  updated_by INTEGER NOT NULL REFERENCES users(id),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (user_id, project_id, type)
+);
+
+CREATE TABLE IF NOT EXISTS work_log (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+  type        TEXT NOT NULL CHECK (type IN ('translation', 'recording', 'adjustment')),
+  entry_id    INTEGER REFERENCES entries(id) ON DELETE SET NULL,
+  audio_id    INTEGER REFERENCES audio_files(id) ON DELETE SET NULL,
+  amount_cents INTEGER NOT NULL,
+  note        TEXT,
+  created_by  INTEGER NOT NULL REFERENCES users(id),
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_work_log_user ON work_log(user_id);
+
+CREATE TABLE IF NOT EXISTS payments (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  amount_cents INTEGER NOT NULL,
+  paid_on     TEXT,
+  method      TEXT,
+  note        TEXT,
+  recorded_by INTEGER NOT NULL REFERENCES users(id),
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id);
+
+CREATE TABLE IF NOT EXISTS rate_changes (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  type       TEXT NOT NULL,
+  old_cents  INTEGER,
+  new_cents  INTEGER NOT NULL,
+  changed_by INTEGER NOT NULL REFERENCES users(id),
+  changed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 `);
 
 // Migration: language tag on recordings ('dene' or 'english').

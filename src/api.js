@@ -735,6 +735,24 @@ function loadEntry(req, res, next) {
   next();
 }
 
+// Compensation ledger: record one billable event, snapshotting the amount from
+// the actor's current rate for this project + work type (0 if no rate is set
+// yet — re-price later via an adjustment). Best-effort: a ledger failure must
+// never break the underlying save.
+function logWork({ userId, projectId, type, entryId = null, audioId = null }) {
+  try {
+    const rate = db
+      .prepare('SELECT rate_cents FROM translator_rates WHERE user_id = ? AND project_id = ? AND type = ?')
+      .get(userId, projectId, type);
+    db.prepare(
+      `INSERT INTO work_log (user_id, project_id, type, entry_id, audio_id, amount_cents, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(userId, projectId, type, entryId, audioId, rate?.rate_cents ?? 0, userId);
+  } catch (err) {
+    console.error('[work_log] failed to log work:', err);
+  }
+}
+
 // Translators contribute recordings only — no entry editing even for entries
 // they happen to have created under a previous role.
 const canEditEntry = (req) =>
@@ -850,6 +868,10 @@ api.post('/entries/:id/translate', loadEntry, (req, res) => {
     `UPDATE entries SET dene_text = ?, english_text = ?, updated_by = ?, updated_at = datetime('now')
      WHERE id = ?`
   ).run(nextDene, nextEnglish, req.user.id, req.entry.id);
+  // Bill the translation when this fills the last missing side (incomplete → complete).
+  if (incomplete && nextDene && nextEnglish) {
+    logWork({ userId: req.user.id, projectId: req.entry.project_id, type: 'translation', entryId: req.entry.id });
+  }
   res.json(db.prepare(`${entrySelect} WHERE e.id = ?`).get(...entryParams(req.user), req.entry.id));
 });
 
@@ -955,6 +977,8 @@ api.post('/entries/:id/audio', loadEntry, audioUpload, async (req, res) => {
       )
       .run(req.entry.id, storedName, req.file.originalname, mime, req.file.size,
            duration, language, speaker, notes, req.user.id).lastInsertRowid;
+    // Bill the recording once, on first creation (re-records reuse the row).
+    logWork({ userId: req.user.id, projectId: req.entry.project_id, type: 'recording', entryId: req.entry.id, audioId: id });
   }
   res.status(existing ? 200 : 201)
     .json({ ...db.prepare('SELECT * FROM audio_files WHERE id = ?').get(id), replaced: !!existing });
@@ -1195,6 +1219,134 @@ api.post('/projects/:id/import', requireSuperadmin, (req, res, next) => {
     skipped_invalid: skippedInvalid,
     total_rows: dataRows.length,
   });
+});
+
+// ---------------------------------------------------------------------------
+// Translator compensation — superadmin manages; translators see their own total
+// ---------------------------------------------------------------------------
+
+const sumWork = db.prepare('SELECT COALESCE(SUM(amount_cents), 0) AS c FROM work_log WHERE user_id = ?');
+const sumPaid = db.prepare('SELECT COALESCE(SUM(amount_cents), 0) AS c FROM payments WHERE user_id = ?');
+
+function totalsFor(userId) {
+  const earned = sumWork.get(userId).c;
+  const paid = sumPaid.get(userId).c;
+  return { earned_cents: earned, paid_cents: paid, balance_cents: earned - paid };
+}
+
+// Shared by the superadmin detail and a translator's own view.
+const workLogFor = db.prepare(
+  `SELECT w.id, w.type, w.amount_cents, w.note, w.created_at, w.entry_id, p.name AS project_name
+   FROM work_log w LEFT JOIN projects p ON p.id = w.project_id
+   WHERE w.user_id = ? ORDER BY w.created_at DESC, w.id DESC`
+);
+const paymentsFor = db.prepare(
+  `SELECT id, amount_cents, paid_on, method, note, created_at FROM payments
+   WHERE user_id = ? ORDER BY COALESCE(paid_on, created_at) DESC, id DESC`
+);
+
+// Any signed-in user sees their own running total, work log, and payments.
+api.get('/me/compensation', (req, res) => {
+  res.json({
+    ...totalsFor(req.user.id),
+    work: workLogFor.all(req.user.id),
+    payments: paymentsFor.all(req.user.id),
+  });
+});
+
+// Everyone there is money to account for: current/past translators and anyone
+// with ledger or payment history.
+api.get('/compensation', requireSuperadmin, (req, res) => {
+  const people = db
+    .prepare(
+      `SELECT u.id, u.name, u.email FROM users u
+       WHERE u.id IN (SELECT user_id FROM memberships WHERE role = 'translator')
+          OR u.id IN (SELECT user_id FROM work_log)
+          OR u.id IN (SELECT user_id FROM payments)
+       ORDER BY u.name`
+    )
+    .all();
+  res.json({ translators: people.map((p) => ({ ...p, ...totalsFor(p.id) })) });
+});
+
+api.get('/compensation/:userId', requireSuperadmin, (req, res) => {
+  const user = db.prepare('SELECT id, name, email FROM users WHERE id = ?').get(req.params.userId);
+  if (!user) return bad(res, 'User not found', 404);
+  const rates = db
+    .prepare(
+      `SELECT r.project_id, p.name AS project_name, r.type, r.rate_cents, r.updated_at
+       FROM translator_rates r JOIN projects p ON p.id = r.project_id
+       WHERE r.user_id = ? ORDER BY p.name, r.type`
+    )
+    .all(user.id);
+  const work = workLogFor.all(user.id);
+  const payments = paymentsFor.all(user.id);
+  // Projects the person belongs to — the set you can set rates for.
+  const projects = db
+    .prepare(
+      `SELECT p.id, p.name FROM projects p JOIN memberships m ON m.project_id = p.id
+       WHERE m.user_id = ? ORDER BY p.name`
+    )
+    .all(user.id);
+  res.json({ user, ...totalsFor(user.id), rates, work, payments, projects });
+});
+
+// Set or change a per-project rate; logs an audit row.
+api.put('/compensation/:userId/rates', requireSuperadmin, (req, res) => {
+  const user = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.userId);
+  if (!user) return bad(res, 'User not found', 404);
+  const projectId = Number(req.body?.project_id);
+  const type = req.body?.type;
+  const rateCents = Math.round(Number(req.body?.rate_cents));
+  if (!projectId || !db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId)) {
+    return bad(res, 'A valid project is required');
+  }
+  if (type !== 'translation' && type !== 'recording') return bad(res, 'Invalid rate type');
+  if (!Number.isFinite(rateCents) || rateCents < 0) return bad(res, 'Rate must be zero or more');
+  const existing = db
+    .prepare('SELECT rate_cents FROM translator_rates WHERE user_id = ? AND project_id = ? AND type = ?')
+    .get(user.id, projectId, type);
+  db.prepare(
+    `INSERT INTO translator_rates (user_id, project_id, type, rate_cents, updated_by)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(user_id, project_id, type) DO UPDATE SET
+       rate_cents = excluded.rate_cents, updated_by = excluded.updated_by, updated_at = datetime('now')`
+  ).run(user.id, projectId, type, rateCents, req.user.id);
+  db.prepare(
+    `INSERT INTO rate_changes (user_id, project_id, type, old_cents, new_cents, changed_by)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(user.id, projectId, type, existing?.rate_cents ?? null, rateCents, req.user.id);
+  res.json({ ok: true });
+});
+
+// Record a payment already made offline (the app never moves money).
+api.post('/compensation/:userId/payments', requireSuperadmin, (req, res) => {
+  const user = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.userId);
+  if (!user) return bad(res, 'User not found', 404);
+  const amount = Math.round(Number(req.body?.amount_cents));
+  if (!Number.isFinite(amount) || amount <= 0) return bad(res, 'Payment amount must be greater than zero');
+  const paidOn = req.body?.paid_on?.trim() || new Date().toISOString().slice(0, 10);
+  db.prepare(
+    `INSERT INTO payments (user_id, amount_cents, paid_on, method, note, recorded_by)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(user.id, amount, paidOn, req.body?.method?.trim() || null, req.body?.note?.trim() || null, req.user.id);
+  res.status(201).json({ ok: true, ...totalsFor(user.id) });
+});
+
+// Manual ledger adjustment (+/-): bonuses, corrections, pricing unrated work.
+api.post('/compensation/:userId/adjustments', requireSuperadmin, (req, res) => {
+  const user = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.userId);
+  if (!user) return bad(res, 'User not found', 404);
+  const amount = Math.round(Number(req.body?.amount_cents));
+  if (!Number.isFinite(amount) || amount === 0) return bad(res, 'Adjustment amount cannot be zero');
+  const note = req.body?.note?.trim();
+  if (!note) return bad(res, 'An adjustment note is required');
+  const projectId = req.body?.project_id ? Number(req.body.project_id) : null;
+  db.prepare(
+    `INSERT INTO work_log (user_id, project_id, type, amount_cents, note, created_by)
+     VALUES (?, ?, 'adjustment', ?, ?, ?)`
+  ).run(user.id, projectId, amount, note, req.user.id);
+  res.status(201).json({ ok: true, ...totalsFor(user.id) });
 });
 
 // ---------------------------------------------------------------------------
