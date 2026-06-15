@@ -641,11 +641,17 @@ async function renderEntries(kind = 'word') {
       Ask your project admin to add you.</div>`;
     return;
   }
+  const ap = activeProject();
 
   view.innerHTML = `
     <div class="page-head">
       <h1>${isPhrase ? 'Phrases' : 'Dictionary'}</h1>
-      <a class="btn" href="#/${isPhrase ? 'phrases' : 'entries'}/new">＋ New ${isPhrase ? 'phrase' : 'entry'}</a>
+      <div class="head-actions">
+        ${isAdminOf(ap.id) ? `
+          <a class="btn secondary small" href="/api/projects/${ap.id}/export?format=csv&kind=${kind}">Export CSV</a>
+          <a class="btn secondary small" href="/api/projects/${ap.id}/export?format=json&kind=${kind}">Export JSON</a>` : ''}
+        <a class="btn" href="#/${isPhrase ? 'phrases' : 'entries'}/new">＋ New ${isPhrase ? 'phrase' : 'entry'}</a>
+      </div>
     </div>
     <div class="filters">
       <input type="search" id="f-q" placeholder="Search Dene or English text…" value="${esc(listState.q)}">
@@ -1142,21 +1148,33 @@ async function renderTranslatorDashboard() {
       Ask your project admin to add you.</div>`;
     return;
   }
+  view.innerHTML = `<div class="empty">Loading…</div>`;
+
+  let recTotal = 0;
+  let transTotal = 0;
+  try {
+    const [rec, trans] = await Promise.all([
+      api(`/entries?project_id=${p.id}&has_audio=no&complete=yes&limit=1`),
+      api(`/entries?project_id=${p.id}&kind=phrase&complete=no&limit=1`),
+    ]);
+    recTotal = rec.total;
+    transTotal = trans.total;
+  } catch { /* counts are decorative — the session views report errors themselves */ }
+
   view.innerHTML = `
     <div class="translator-home">
       <h1>Welcome, ${esc(state.me.user.name)}</h1>
       <p class="translator-project">${esc(p.name)}${p.dialect ? ` — ${esc(p.dialect)}` : ''}</p>
-      <p class="queue-count" id="queue-count">&nbsp;</p>
-      <button class="big-action" id="start-session">⏺ Start recording session</button>
+      ${transTotal > 0 ? `
+        <p class="queue-count">${transTotal} ${transTotal === 1 ? 'phrase needs' : 'phrases need'} translation.</p>
+        <button class="big-action" id="start-translate">✎ Start translations session</button>` : ''}
+      <p class="queue-count">${recTotal === 0
+        ? 'Every entry has a recording — check back later.'
+        : `${recTotal} ${recTotal === 1 ? 'entry needs' : 'entries need'} a recording.`}</p>
+      <button class="big-action" id="start-record" ${recTotal === 0 ? 'disabled' : ''}>⏺ Start recording session</button>
     </div>`;
-  $('#start-session').addEventListener('click', () => { location.hash = '#/record'; });
-  try {
-    const data = await api(`/entries?project_id=${p.id}&has_audio=no&complete=yes&limit=1`);
-    $('#queue-count').textContent = data.total === 0
-      ? 'Every entry has a recording — check back later.'
-      : `${data.total} ${data.total === 1 ? 'entry needs' : 'entries need'} a recording.`;
-    if (data.total === 0) $('#start-session').disabled = true;
-  } catch { /* count is decorative — the session view reports errors itself */ }
+  $('#start-record').addEventListener('click', () => { location.hash = '#/record'; });
+  $('#start-translate')?.addEventListener('click', () => { location.hash = '#/translate'; });
 }
 
 // ---------------------------------------------------------------------------
@@ -1335,6 +1353,117 @@ function setupSessionRecorder(entry) {
 }
 
 // ---------------------------------------------------------------------------
+// Translation session — cycle through incomplete phrases and fill them in
+// ---------------------------------------------------------------------------
+
+const transSession = { queue: [], pos: 0, total: 0 };
+
+async function renderTranslateSession() {
+  setActiveNav('dashboard');
+  const p = activeProject();
+  if (!p) { location.hash = '#/dashboard'; return; }
+  view.innerHTML = `<div class="empty">Loading…</div>`;
+  let data;
+  try { data = await api(`/entries?project_id=${p.id}&kind=phrase&complete=no&limit=200`); }
+  catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+  transSession.queue = data.entries;
+  transSession.pos = 0;
+  transSession.total = data.total;
+  renderTranslateCard();
+}
+
+function renderTranslateCard() {
+  const entry = transSession.queue[transSession.pos];
+  if (!entry) { renderTranslateDone(); return; }
+
+  const badges = [
+    entry.category ? `<span class="badge">${esc(entry.category)}</span>` : '',
+    entry.status !== 'draft' ? `<span class="badge status-${entry.status}">${entry.status}</span>` : '',
+  ].filter(Boolean).join(' ');
+
+  view.innerHTML = `
+    <div class="rec-session">
+      <div class="rec-progress">
+        <a href="#/dashboard">‹ Exit</a>
+        <span>${transSession.pos + 1} of ${transSession.queue.length}${transSession.total > transSession.queue.length ? ` (${transSession.total} waiting in total)` : ''}</span>
+        <span>${esc(entry.project_name)}</span>
+      </div>
+      <div class="card">
+        <form id="translate-form">
+          <label class="field"><span>Dene phrase or word</span>
+            <input type="text" name="dene_text" id="dene-input" class="dene" lang="den" spellcheck="false" value="${esc(entry.dene_text)}"></label>
+          ${palette('#dene-input')}
+          <label class="field"><span>English translation</span>
+            <input type="text" name="english_text" value="${esc(entry.english_text)}"></label>
+          <p class="error-msg" hidden></p>
+          <div class="rec-meta" style="border-top:1px solid var(--line);padding-top:0.8rem;align-items:flex-start">
+            ${badges ? `<div>${badges}</div>` : ''}
+            ${entry.source_doc ? `<div>Source: ${esc(entry.source_doc)}</div>` : ''}
+            ${entry.notes ? `<div>Notes: ${esc(entry.notes)}</div>` : ''}
+            <div>Added by ${esc(entry.created_by_name)} · ${fmtDate(entry.created_at)}</div>
+          </div>
+        </form>
+      </div>
+      <div class="rec-actions">
+        <button class="secondary" id="save-exit">Save &amp; exit</button>
+        <button id="save-next">Save &amp; next</button>
+        <button class="ghost" id="skip-btn">Skip ›</button>
+      </div>
+    </div>`;
+
+  setupTranslateCard(entry);
+}
+
+function renderTranslateDone() {
+  view.innerHTML = `
+    <div class="translator-home">
+      <h1>All done 🎉</h1>
+      <p class="queue-count">Every phrase in this list has a translation. Mahsi cho!</p>
+      <div class="rec-actions">
+        <button class="secondary" id="back-dash">Back to dashboard</button>
+        <button id="check-more">Check for more</button>
+      </div>
+    </div>`;
+  $('#back-dash').addEventListener('click', () => { location.hash = '#/dashboard'; });
+  $('#check-more').addEventListener('click', renderTranslateSession);
+}
+
+/** Fill in → save flow for one phrase card. */
+function setupTranslateCard(entry) {
+  const form = $('#translate-form');
+  const saveExit = $('#save-exit');
+  const saveNext = $('#save-next');
+  const skipBtn = $('#skip-btn');
+
+  async function save() {
+    const dene = form.dene_text.value.trim();
+    const english = form.english_text.value.trim();
+    if (!dene && !english) throw new Error('Enter a Dene phrase or an English meaning');
+    await api(`/entries/${entry.id}/translate`, {
+      method: 'POST',
+      body: { dene_text: dene, english_text: english },
+    });
+  }
+
+  async function saveThen(after) {
+    saveExit.disabled = saveNext.disabled = skipBtn.disabled = true;
+    try {
+      await save();
+    } catch (err) {
+      showFormError(form, err.message);
+      saveExit.disabled = saveNext.disabled = skipBtn.disabled = false;
+      return;
+    }
+    toast('Translation saved');
+    after();
+  }
+
+  saveExit.addEventListener('click', () => saveThen(() => { location.hash = '#/dashboard'; }));
+  saveNext.addEventListener('click', () => saveThen(() => { transSession.pos++; renderTranslateCard(); }));
+  skipBtn.addEventListener('click', () => { transSession.pos++; renderTranslateCard(); });
+}
+
+// ---------------------------------------------------------------------------
 // Dashboard view
 // ---------------------------------------------------------------------------
 
@@ -1463,6 +1592,11 @@ function showImportModal(projectId, projectName) {
       within the file are skipped, so re-importing the same file is safe.
       Max 10,000 rows per file.</p>
     <form id="import-form">
+      <label class="field"><span>Import as</span>
+        <select name="kind">
+          <option value="word">Dictionary words (both sides required)</option>
+          <option value="phrase">Phrases (one side may be blank)</option>
+        </select></label>
       <label class="field"><span>CSV file</span>
         <input type="file" name="file" accept=".csv,.txt,text/csv" required></label>
       <p class="error-msg" hidden></p>
@@ -1475,6 +1609,7 @@ function showImportModal(projectId, projectName) {
     e.preventDefault();
     const f = e.target;
     const fd = new FormData();
+    fd.append('kind', f.kind.value); // before the file so multer parses it
     fd.append('file', f.file.files[0]);
     const btn = $('#import-submit', m);
     btn.disabled = true;
@@ -1814,8 +1949,10 @@ function route() {
   if ((m = hash.match(/^#\/request\/([a-f0-9]{64})$/))) { renderRequestForm(m[1]); return; }
   if (!state.me) { renderLogin(); return; }
   if (isTranslator()) {
-    // Translators see only their dashboard and the recording session.
+    // Translators see only their dashboard, the recording session, and the
+    // translation session.
     if (hash === '#/record') renderRecordSession();
+    else if (hash === '#/translate') renderTranslateSession();
     else if (hash === '#/dashboard') renderTranslatorDashboard();
     else location.hash = '#/dashboard';
     return;

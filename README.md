@@ -38,12 +38,15 @@ admins; project admins manage their own project's members. There is no public si
 | Superadmin | Everything, across all projects; creates projects and project admins |
 | Project admin | Manage members, review/verify entries, export, edit any entry — in their project only |
 | Member | Create entries, edit/delete their own entries, upload audio, search within their projects |
-| Translator | Recording only — sees a stripped-down app that cycles through entries without audio so they can record them; cannot create or edit entries |
+| Translator | Recording and translating only — a stripped-down app with a recording session (entries without audio) and a translation session (incomplete phrases). Can complete a phrase's missing side but cannot otherwise create or edit entries |
 
-Translators land on a dashboard with a single **Start recording session** button. Each
-card shows the Dene text large, the English below it, a record/playback control, and the
-entry's metadata, with **Save & next** / **Save & exit** (and **Skip**) to move through
-the queue. Project admins assign the role from the project's **Members** page.
+Translators land on a dashboard with a **Start recording session** button and, whenever
+phrases are awaiting translation, a count and a **Start translations session** button.
+The recording session shows the Dene text large, the English below it, a record/playback
+control, and the entry's metadata. The translation session shows two text boxes (the Dene
+phrase/word and the English translation) plus the same metadata, so the translator fills
+the missing side. Both sessions use **Save & next** / **Save & exit** / **Skip** to move
+through the queue. Project admins assign the role from the project's **Members** page.
 
 Removing a member takes effect immediately (membership is checked on every request);
 their past contributions remain attributed to them.
@@ -58,12 +61,20 @@ review status, search, audio, export). The **Dictionary** tab lists words; the
 The one behavioural difference: a **dictionary word requires both the Dene and
 English sides**, while a **phrase may be saved with only one side** (the other
 left blank). A one-sided phrase is flagged **"Needs translation"** and is
-completed later from its normal edit screen — there's no separate translation
-workflow. Once both sides are present, the phrase behaves like any entry and
-flows into the **same recording queue** as words (an incomplete phrase is held
+completed either from its normal edit screen or through a translator's
+**translation session**. Once both sides are present, the phrase behaves like
+any entry and flows into the **same recording queue** as words (an incomplete phrase is held
 out of the queue and can't be recorded until it's translated). Filter the
 Phrases list by translation state with the "Needs translation / Complete"
 selector.
+
+**Import/export by kind.** CSV import (superadmin) has an *Import as* selector —
+**Dictionary words** (both columns required) or **Phrases** (a row may fill only
+one side; recognises a `dene_text`/`english_text` header and accepts just one of
+them). Dedup is scoped per kind, so the same text can exist as both a word and a
+phrase. Each list tab has its own **Export CSV/JSON** (admins) that exports just
+that kind (`?kind=word|phrase`); the project card's export still produces the
+full project, with a `kind` column distinguishing words from phrases.
 
 ## Recording audio
 

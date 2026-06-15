@@ -834,6 +834,25 @@ api.delete('/entries/:id', loadEntry, (req, res) => {
   res.json({ ok: true });
 });
 
+// Fill in a phrase's missing side (the translator's translation session). Any
+// project member — including translators, who otherwise can't edit entries —
+// may complete an incomplete phrase; rewriting an already-complete phrase still
+// needs normal edit rights.
+api.post('/entries/:id/translate', loadEntry, (req, res) => {
+  if (req.entry.kind !== 'phrase') return bad(res, 'Only phrases can be translated here');
+  const incomplete = req.entry.dene_text === '' || req.entry.english_text === '';
+  if (!incomplete && !canEditEntry(req)) return bad(res, 'This phrase is already complete', 403);
+  const { dene_text, english_text } = req.body ?? {};
+  const nextDene = dene_text !== undefined ? String(dene_text).trim() : req.entry.dene_text;
+  const nextEnglish = english_text !== undefined ? String(english_text).trim() : req.entry.english_text;
+  if (!nextDene && !nextEnglish) return bad(res, 'Enter a Dene phrase or an English meaning');
+  db.prepare(
+    `UPDATE entries SET dene_text = ?, english_text = ?, updated_by = ?, updated_at = datetime('now')
+     WHERE id = ?`
+  ).run(nextDene, nextEnglish, req.user.id, req.entry.id);
+  res.json(db.prepare(`${entrySelect} WHERE e.id = ?`).get(...entryParams(req.user), req.entry.id));
+});
+
 // ---------------------------------------------------------------------------
 // Audio attachments
 // ---------------------------------------------------------------------------
@@ -989,21 +1008,26 @@ api.delete('/audio/:id', loadAudio, (req, res) => {
 // ---------------------------------------------------------------------------
 
 api.get('/projects/:id/export', requireProjectAdmin, (req, res) => {
+  // Optional ?kind exports just the dictionary words or just the phrases;
+  // without it, the file contains everything (the kind column distinguishes them).
+  const kind = req.query.kind === 'word' || req.query.kind === 'phrase' ? req.query.kind : null;
+  const kindSql = kind ? ' AND e.kind = ?' : '';
+  const kindArg = kind ? [kind] : [];
   const rows = db
     .prepare(
       `SELECT e.id, e.kind, e.dene_text, e.english_text, e.source_doc, e.notes, e.category, e.status,
               cu.name AS contributor, e.created_at, e.updated_at
        FROM entries e JOIN users cu ON cu.id = e.created_by
-       WHERE e.project_id = ? ORDER BY e.id`
+       WHERE e.project_id = ?${kindSql} ORDER BY e.id`
     )
-    .all(req.project.id);
+    .all(req.project.id, ...kindArg);
   const audioByEntry = new Map();
   for (const a of db
     .prepare(
       `SELECT a.entry_id, a.stored_name, a.original_name, a.duration_seconds, a.language, a.speaker
-       FROM audio_files a JOIN entries e ON e.id = a.entry_id WHERE e.project_id = ?`
+       FROM audio_files a JOIN entries e ON e.id = a.entry_id WHERE e.project_id = ?${kindSql}`
     )
-    .all(req.project.id)) {
+    .all(req.project.id, ...kindArg)) {
     if (!audioByEntry.has(a.entry_id)) audioByEntry.set(a.entry_id, []);
     audioByEntry.get(a.entry_id).push({
       file: `audio/${a.stored_name}`,
@@ -1015,7 +1039,7 @@ api.get('/projects/:id/export', requireProjectAdmin, (req, res) => {
   }
 
   const stamp = new Date().toISOString().slice(0, 10);
-  const base = `${req.project.name.replace(/[^\w-]+/g, '_')}_${stamp}`;
+  const base = `${req.project.name.replace(/[^\w-]+/g, '_')}_${stamp}${kind ? `_${kind}s` : ''}`;
 
   if (req.query.format === 'csv') {
     const esc = (v) => {
@@ -1098,6 +1122,7 @@ api.post('/projects/:id/import', requireSuperadmin, (req, res, next) => {
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
   if (!project) return bad(res, 'Project not found', 404);
   if (!req.file) return bad(res, 'No CSV file provided');
+  const kind = req.body?.kind === 'phrase' ? 'phrase' : 'word';
 
   const text = req.file.buffer.toString('utf8').replace(/^\uFEFF/, '');
   const rows = parseCsv(text).filter((r) => r.some((c) => c.trim() !== ''));
@@ -1111,15 +1136,20 @@ api.post('/projects/:id/import', requireSuperadmin, (req, res, next) => {
   let engIdx = header.findIndex((h) => h.includes('english') || h === 'eng');
   let catIdx = header.findIndex((h) => h.includes('categor'));
   let dataRows;
-  if (deneIdx >= 0 && engIdx >= 0) {
-    dataRows = rows.slice(1);
-  } else if (rows[0].length >= 2) {
+  if (deneIdx >= 0 || engIdx >= 0) {
+    dataRows = rows.slice(1); // recognizable header (one or both sides named)
+  } else {
     deneIdx = 0;
     engIdx = 1;
-    catIdx = 2; // optional third column
+    catIdx = 2; // no header: assume Dene, English, [Category]
     dataRows = rows;
-  } else {
-    return bad(res, 'Could not find Dene and English columns — use a header row like "dene_text,english_text" or a two-column file (Dene first, English second)');
+  }
+  // Words need both columns; phrases need at least one.
+  if (kind === 'word' && (deneIdx < 0 || engIdx < 0)) {
+    return bad(res, 'For a dictionary import, include both a Dene and an English column (header like "dene_text,english_text" or a two-column file).');
+  }
+  if (kind === 'phrase' && deneIdx < 0 && engIdx < 0) {
+    return bad(res, 'Include a Dene and/or English column (header like "dene_text,english_text").');
   }
   if (dataRows.length > MAX_IMPORT_ROWS) {
     return bad(res, `Too many rows (${dataRows.length}) — max ${MAX_IMPORT_ROWS} per import. Split the file and try again.`);
@@ -1127,15 +1157,16 @@ api.post('/projects/:id/import', requireSuperadmin, (req, res, next) => {
 
   // Idempotent: skip pairs that already exist in the project, and duplicates
   // within the file itself.
+  // Dedup is scoped by kind so the same text may exist as both a word and a phrase.
   const seen = new Set(
-    db.prepare('SELECT dene_text, english_text FROM entries WHERE project_id = ?')
-      .all(project.id)
+    db.prepare('SELECT dene_text, english_text FROM entries WHERE project_id = ? AND kind = ?')
+      .all(project.id, kind)
       .map((e) => JSON.stringify([e.dene_text, e.english_text]))
   );
   const sourceDoc = `CSV import: ${req.file.originalname}`;
   const insert = db.prepare(
-    `INSERT INTO entries (project_id, dene_text, english_text, category, source_doc, created_by, updated_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO entries (project_id, kind, dene_text, english_text, category, source_doc, created_by, updated_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   );
 
   let imported = 0;
@@ -1143,14 +1174,16 @@ api.post('/projects/:id/import', requireSuperadmin, (req, res, next) => {
   let skippedInvalid = 0;
   db.transaction(() => {
     for (const r of dataRows) {
-      const dene = (r[deneIdx] ?? '').trim();
-      const english = (r[engIdx] ?? '').trim();
+      const dene = (deneIdx >= 0 ? r[deneIdx] ?? '' : '').trim();
+      const english = (engIdx >= 0 ? r[engIdx] ?? '' : '').trim();
       const category = catIdx >= 0 ? (r[catIdx] ?? '').trim() || null : null;
-      if (!dene || !english) { skippedInvalid++; continue; }
+      // Words require both sides; phrases require at least one.
+      const valid = kind === 'phrase' ? (dene || english) : (dene && english);
+      if (!valid) { skippedInvalid++; continue; }
       const key = JSON.stringify([dene, english]);
       if (seen.has(key)) { skippedDuplicates++; continue; }
       seen.add(key);
-      insert.run(project.id, dene, english, category, sourceDoc, req.user.id, req.user.id);
+      insert.run(project.id, kind, dene, english, category, sourceDoc, req.user.id, req.user.id);
       imported++;
     }
   })();

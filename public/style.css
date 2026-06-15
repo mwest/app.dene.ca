@@ -96,6 +96,8 @@ main {
 }
 .page-head h1 { margin: 0; font-size: 1.5rem; }
 .page-context { color: var(--muted); font-size: 0.95rem; font-weight: 500; }
+.head-actions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+.btn.small { padding: 0.25rem 0.6rem; font-size: 0.85rem; }
 
 .card {
   background: var(--panel);

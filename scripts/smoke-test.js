@@ -368,6 +368,50 @@ fd.append('file', new Blob(['not,a,csv'], { type: 'text/plain' }), 'data.json');
 r = await sa.req('POST', `/api/projects/${projectId}/import`, fd, true);
 check('non-CSV file rejected', r.status === 400);
 
+// --- import/export by kind (isolated project so other counts are unaffected) ---
+r = await sa.req('POST', '/api/projects', { name: pname + ' Imp' });
+const impProj = r.data.id;
+
+let impCsv = 'dene_text,english_text\nkų,house\nłı,dog\n';
+fd = new FormData();
+fd.append('kind', 'word');
+fd.append('file', new Blob([impCsv], { type: 'text/csv' }), 'words.csv');
+r = await sa.req('POST', `/api/projects/${impProj}/import`, fd, true);
+check('import as words', r.status === 200 && r.data.imported === 2, JSON.stringify(r.data));
+
+impCsv = 'dene_text,english_text\nedǝ honı̨dǝ,how are you\n,sit down please\nması̨ cho,\n';
+fd = new FormData();
+fd.append('kind', 'phrase');
+fd.append('file', new Blob([impCsv], { type: 'text/csv' }), 'phrases.csv');
+r = await sa.req('POST', `/api/projects/${impProj}/import`, fd, true);
+check('import as phrases allows one-sided rows', r.status === 200 && r.data.imported === 3, JSON.stringify(r.data));
+
+impCsv = 'dene_text,english_text\nkų,house\n';
+fd = new FormData();
+fd.append('kind', 'phrase');
+fd.append('file', new Blob([impCsv], { type: 'text/csv' }), 'dup.csv');
+r = await sa.req('POST', `/api/projects/${impProj}/import`, fd, true);
+check('dedup is scoped by kind', r.status === 200 && r.data.imported === 1, JSON.stringify(r.data));
+
+r = await sa.req('GET', `/api/entries?project_id=${impProj}&kind=word`);
+check('imported words tagged kind=word', r.status === 200 && r.data.total === 2 &&
+  r.data.entries.every((e) => e.kind === 'word'), JSON.stringify(r.data.total));
+r = await sa.req('GET', `/api/entries?project_id=${impProj}&kind=phrase`);
+check('imported phrases tagged kind=phrase', r.status === 200 && r.data.total === 4 &&
+  r.data.entries.every((e) => e.kind === 'phrase'), JSON.stringify(r.data.total));
+
+r = await sa.req('GET', `/api/projects/${impProj}/export?format=json&kind=word`);
+check('export kind=word returns only words', r.status === 200 && r.data.entries.length === 2 &&
+  r.data.entries.every((e) => e.kind === 'word'), JSON.stringify(r.data.entries.length));
+r = await sa.req('GET', `/api/projects/${impProj}/export?format=json&kind=phrase`);
+check('export kind=phrase returns only phrases', r.status === 200 && r.data.entries.length === 4 &&
+  r.data.entries.every((e) => e.kind === 'phrase'), JSON.stringify(r.data.entries.length));
+r = await sa.req('GET', `/api/projects/${impProj}/export?format=csv`);
+check('combined CSV export has a kind column', r.status === 200 &&
+  String(r.data).split('\n')[0].includes('kind'), String(r.data).split('\n')[0]);
+
+await sa.req('DELETE', `/api/projects/${impProj}`, { confirm_name: pname + ' Imp' });
+
 // --- phrases (entries with kind='phrase'; one side may be blank → incomplete) ---
 // Created and cleaned up here so the project's entry/recording counts are
 // unchanged for the deletion assertions below.
@@ -421,6 +465,20 @@ check('cannot blank both sides of a phrase', r.status === 400);
 
 r = await translator.req('POST', '/api/entries', { project_id: projectId, kind: 'phrase', english_text: 'nope' });
 check('translator cannot create phrases', r.status === 403);
+
+// translation session endpoint: a translator may complete an incomplete phrase
+r = await translator.req('POST', `/api/entries/${phraseDeneOnly}/translate`, { dene_text: '', english_text: '' });
+check('translate rejects blanking both sides', r.status === 400);
+
+r = await translator.req('POST', `/api/entries/${phraseDeneOnly}/translate`, { dene_text: 'sǫǫ', english_text: 'water (clean)' });
+check('translator completes a phrase via translate', r.status === 200 &&
+  r.data.dene_text === 'sǫǫ' && r.data.english_text === 'water (clean)', JSON.stringify(r.data));
+
+r = await translator.req('POST', `/api/entries/${phraseDeneOnly}/translate`, { english_text: 'changed again' });
+check('translator cannot re-translate a completed phrase', r.status === 403);
+
+r = await translator.req('POST', `/api/entries/${entryId}/translate`, { english_text: 'x' });
+check('translate rejected on a dictionary word', r.status === 400);
 
 // clean up the phrases (and their cascade-deleted audio) to keep counts stable
 for (const pid of [phraseDeneOnly, phraseEngOnly, phraseBoth]) {
