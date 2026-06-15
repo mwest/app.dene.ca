@@ -625,13 +625,16 @@ api.get('/projects/:id/stats', (req, res) => {
        WHERE e.project_id = ? ORDER BY e.updated_at DESC, e.id DESC LIMIT 10`
     )
     .all(projectId);
+  // Optional ?kind scopes the contributor list/counts to one entry kind so the
+  // Dictionary and Phrases filters each show only their own contributors.
+  const kind = req.query.kind === 'word' || req.query.kind === 'phrase' ? req.query.kind : null;
   const contributors = db
     .prepare(
       `SELECT u.id, u.name, COUNT(*) AS entry_count
        FROM entries e JOIN users u ON u.id = e.created_by
-       WHERE e.project_id = ? GROUP BY u.id ORDER BY entry_count DESC`
+       WHERE e.project_id = ?${kind ? ' AND e.kind = ?' : ''} GROUP BY u.id ORDER BY entry_count DESC`
     )
-    .all(projectId);
+    .all(...(kind ? [projectId, kind] : [projectId]));
   res.json({ ...stats, recent, contributors });
 });
 

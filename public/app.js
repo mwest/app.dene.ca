@@ -691,7 +691,7 @@ async function populateContributors() {
   const pid = activeProject()?.id;
   if (!pid) return;
   try {
-    const stats = await api(`/projects/${pid}/stats`);
+    const stats = await api(`/projects/${pid}/stats?kind=${listState.kind}`);
     sel.innerHTML = '<option value="">All contributors</option>' +
       stats.contributors.map((c) =>
         `<option value="${c.id}" ${String(c.id) === String(listState.contributor) ? 'selected' : ''}>${esc(c.name)} (${c.entry_count})</option>`).join('');
