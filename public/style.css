@@ -170,23 +170,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .error-msg { color: var(--danger); font-weight: 500; margin: 0.5rem 0; }
 
-/* ---- Dene character palette ---- */
-.char-palette {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  margin: 0.35rem 0 0.5rem;
-}
-.char-palette button {
-  background: var(--accent-soft);
-  color: var(--ink);
-  font-weight: 500;
-  font-size: 1.05rem;
-  padding: 0.15rem 0.55rem;
-  border-radius: 6px;
-  min-width: 2rem;
-}
-.char-palette button:hover { background: var(--accent); color: #fff; }
+/* ---- Small form hints ---- */
 .palette-hint { font-size: 0.78rem; color: var(--muted); margin: 0.1rem 0 0.3rem; }
 
 /* ---- Translation requests / jobs ---- */

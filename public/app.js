@@ -111,44 +111,6 @@ function isTranslator() {
 }
 
 // ---------------------------------------------------------------------------
-// Dene character palette
-// ---------------------------------------------------------------------------
-
-const DENE_CHARS = [
-  'ʔ', 'ł', 'ą', 'ę', 'į', 'ǫ', 'ų', 'á', 'é', 'í', 'ó', 'ú',
-  'ą́', 'ę́', 'į́', 'ǫ́', 'ų́', 'ë', 'ï', 'ö', 'ü', 'ı', 'Ł', 'ʕ',
-];
-
-function palette(targetSelector) {
-  return `
-    <div class="char-palette" data-target="${esc(targetSelector)}">
-      ${DENE_CHARS.map((c) => `<button type="button" tabindex="-1">${c}</button>`).join('')}
-    </div>
-    <div class="palette-hint">Click a character to insert it at the cursor. Hold <b>Shift</b> for uppercase.</div>`;
-}
-
-document.addEventListener('mousedown', (e) => {
-  // keep focus in the text field while clicking palette buttons
-  if (e.target.closest('.char-palette button')) e.preventDefault();
-});
-
-document.addEventListener('click', (e) => {
-  const btn = e.target.closest('.char-palette button');
-  if (!btn) return;
-  const paletteEl = btn.closest('.char-palette');
-  const input = $(paletteEl.dataset.target);
-  if (!input) return;
-  let ch = btn.textContent;
-  if (e.shiftKey) ch = ch.toLocaleUpperCase();
-  const start = input.selectionStart ?? input.value.length;
-  const end = input.selectionEnd ?? input.value.length;
-  input.value = input.value.slice(0, start) + ch + input.value.slice(end);
-  input.focus();
-  input.selectionStart = input.selectionEnd = start + ch.length;
-  input.dispatchEvent(new Event('input', { bubbles: true }));
-});
-
-// ---------------------------------------------------------------------------
 // Microphone recorder — captures raw PCM and encodes MP3 with lamejs
 // ---------------------------------------------------------------------------
 
@@ -992,7 +954,6 @@ function renderNewEntry(kind = 'word') {
         ${isPhrase ? '<p class="form-hint">Enter a Dene phrase, an English meaning, or both. If you enter only one, it will be queued for translation.</p>' : ''}
         <label class="field"><span>${isPhrase ? 'Dene phrase' : 'Dene text'}</span>
           <input type="text" name="dene_text" id="dene-input" class="dene" ${req} lang="den" spellcheck="false"></label>
-        ${palette('#dene-input')}
         <label class="field"><span>${isPhrase ? 'English meaning' : 'English text'}</span>
           <input type="text" name="english_text" ${req}></label>
         <div class="form-row">
@@ -1114,7 +1075,6 @@ async function renderEntryDetail(id) {
           <label class="field"><span>${isPhrase ? 'English meaning' : 'English text'}</span>
             <textarea name="english_text" ${isPhrase ? '' : 'required'} ${ro ? 'readonly' : ''}>${esc(entry.english_text)}</textarea></label>
         </div>
-        ${ro ? '' : palette('#dene-input')}
         <div class="form-row">
           <label class="field"><span>Category</span>
             <input type="text" name="category" value="${esc(entry.category ?? '')}" ${ro ? 'readonly' : ''} placeholder="e.g. greetings, animals"></label>
@@ -1662,7 +1622,6 @@ function renderTranslateCard() {
         <form id="translate-form">
           <label class="field"><span>Dene phrase or word</span>
             <input type="text" name="dene_text" id="dene-input" class="dene" lang="den" spellcheck="false" value="${esc(entry.dene_text)}"></label>
-          ${palette('#dene-input')}
           <label class="field"><span>English translation</span>
             <input type="text" name="english_text" value="${esc(entry.english_text)}"></label>
           <p class="error-msg" hidden></p>
