@@ -1028,16 +1028,18 @@ async function renderEntryDetail(id) {
       <p class="form-hint">Add the translation above before recording this phrase.</p>
     </div>` : `
     <div class="card">
-      <h2 style="margin-top:0">Your recordings</h2>
-      <div class="audio-slots" id="audio-slots">
-        ${slotHtml('dene', mine.dene)}
-        ${mine.english ? slotHtml('english', mine.english) : '' /* legacy English recordings stay manageable; no new ones */}
-      </div>
       ${others.length ? `
-      <div id="audio-list" style="border-top:1px solid var(--line);margin-top:1rem">
-        <h3 style="margin:0.8rem 0 0.2rem">All recordings (admin view)</h3>
+      <div id="audio-list">
+        <h2 style="margin-top:0">All recordings${isAdmin ? ' (admin view)' : ''}</h2>
         ${others.map((a) => audioItemHtml(a, entry)).join('')}
       </div>` : '<div id="audio-list"></div>'}
+      <div style="${others.length ? 'border-top:1px solid var(--line);margin-top:1rem;padding-top:0.8rem' : ''}">
+        <h2 style="margin-top:0">Your recordings</h2>
+        <div class="audio-slots" id="audio-slots">
+          ${slotHtml('dene', mine.dene)}
+          ${mine.english ? slotHtml('english', mine.english) : '' /* legacy English recordings stay manageable; no new ones */}
+        </div>
+      </div>
       <details style="border-top:1px solid var(--line);padding-top:0.8rem;margin-top:1rem">
         <summary style="cursor:pointer;color:var(--muted)">Upload an audio file instead (WAV / MP3 / M4A)</summary>
         <p style="color:var(--muted);font-size:0.85rem">Uploading replaces your existing recording for that language.</p>
