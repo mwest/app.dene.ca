@@ -120,6 +120,31 @@ for bookkeeping. Translators see their own running *earned / paid / balance* on 
 dashboard. All amounts are stored as integer cents (CAD). Rate changes are kept in an
 audit table.
 
+## Semantic search
+
+The Dictionary and Phrases lists have a **Smart search** toggle. With it on, the
+query is matched by *meaning* against the English side — so "greeting" surfaces
+"how are you" — rather than by substring; exact keyword matches are boosted to
+the top (hybrid). Plain substring search is the default and is unchanged.
+
+Embeddings are produced by a **local** sentence-transformer
+(`Xenova/all-MiniLM-L6-v2`, 384-dim) run on-device with `transformers.js` —
+the text never leaves the server. Each entry's English embedding is stored as a
+`BLOB` on the `entries` row (with the model name, so a model change can be
+detected); ranking is a brute-force cosine in memory, which is ample at this
+corpus size. The model weights (~90 MB) download once to `data/models` on the
+volume and persist across deploys. After deploying, run a one-time backfill for
+existing rows:
+
+```powershell
+node scripts/embed-backfill.js          # local
+bash scripts/prod-ssh.sh "node scripts/embed-backfill.js"   # production
+```
+
+Semantic search covers the **English** side only (the Dene side is low-resource
+with no good embedding model). The production VM runs with 1 GB memory to fit
+the model alongside Node + SQLite.
+
 ## Data layout
 
 - `data/dene.db` — SQLite database (users, sessions, projects, memberships, entries,

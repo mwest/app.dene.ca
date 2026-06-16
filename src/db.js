@@ -194,6 +194,15 @@ if (!entryCols.includes('kind')) {
   db.exec(`ALTER TABLE entries ADD COLUMN kind TEXT NOT NULL DEFAULT 'word'`);
 }
 
+// Migration: semantic-search embedding of the English text (+ which model
+// produced it, so a model change can be detected and re-backfilled).
+if (!entryCols.includes('embedding')) {
+  db.exec(`ALTER TABLE entries ADD COLUMN embedding BLOB`);
+}
+if (!entryCols.includes('embedding_model')) {
+  db.exec(`ALTER TABLE entries ADD COLUMN embedding_model TEXT`);
+}
+
 // Migration: 'translator' membership role. SQLite cannot alter a CHECK
 // constraint, so older databases get the memberships table rebuilt once.
 const memTableSql = db

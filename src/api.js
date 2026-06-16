@@ -6,6 +6,7 @@ import path from 'node:path';
 import { parseFile } from 'music-metadata';
 
 import db, { AUDIO_DIR, REQUESTS_DIR, roleIn, projectsFor, projectIdsFor } from './db.js';
+import { embed, toBlob, fromBlob, cosine, MODEL } from './embed.js';
 import { APP_URL, inviteEmail, requestFormEmail, requestNotifyEmail, resetEmail, sendMail } from './mail.js';
 import {
   COOKIE_NAME,
@@ -660,10 +661,12 @@ const entrySelect = `
 // Positional params consumed by entrySelect, in SQL text order.
 const entryParams = () => [];
 
-api.get('/entries', (req, res) => {
+api.get('/entries', async (req, res) => {
   const visible = projectIdsFor(req.user);
   if (visible.length === 0) return res.json({ entries: [], total: 0 });
 
+  const q = String(req.query.q ?? '').trim();
+  const semantic = !!q && (req.query.semantic === '1' || req.query.semantic === 'yes');
   const where = [];
   const params = [];
 
@@ -677,8 +680,10 @@ api.get('/entries', (req, res) => {
     params.push(...visible);
   }
 
-  if (req.query.q) {
-    const like = `%${String(req.query.q).trim()}%`;
+  // Keyword (substring) filter — skipped in semantic mode, where every in-scope
+  // entry is instead ranked purely by meaning (see below).
+  if (q && !semantic) {
+    const like = `%${q}%`;
     where.push('(e.dene_text LIKE ? OR e.english_text LIKE ? OR e.source_doc LIKE ? OR e.notes LIKE ? OR e.category LIKE ?)');
     params.push(like, like, like, like, like);
   }
@@ -710,12 +715,43 @@ api.get('/entries', (req, res) => {
   }
 
   const whereSql = `WHERE ${where.join(' AND ')}`;
+  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  const offset = Math.max(Number(req.query.offset) || 0, 0);
+
+  if (semantic) {
+    // Rank the in-scope entries by cosine similarity of their English embedding
+    // to the query, with substring matches boosted above pure meaning matches.
+    const cands = db
+      .prepare(`SELECT e.id, e.dene_text, e.english_text, e.embedding FROM entries e ${whereSql}`)
+      .all(...params);
+    let qvec;
+    try { qvec = await embed(q); }
+    catch { return bad(res, 'Semantic search is temporarily unavailable', 503); }
+    // Rank purely by semantic similarity — exact substring matches are not
+    // boosted, so a closer-in-meaning result can outrank a literal one.
+    const ranked = cands
+      .map((c) => ({
+        id: c.id,
+        score: c.embedding ? cosine(qvec, fromBlob(c.embedding)) : -1,
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    const total = ranked.length;
+    const pageIds = ranked.slice(offset, offset + limit).map((r) => r.id);
+    let entries = [];
+    if (pageIds.length) {
+      const rows = db
+        .prepare(`${entrySelect} WHERE e.id IN (${pageIds.map(() => '?').join(',')})`)
+        .all(...entryParams(req.user), ...pageIds);
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      entries = pageIds.map((id) => byId.get(id)).filter(Boolean); // preserve rank order
+    }
+    return res.json({ entries, total, limit, offset, semantic: true });
+  }
+
   const total = db
     .prepare(`SELECT COUNT(*) AS n FROM entries e ${whereSql}`)
     .get(...params).n;
-
-  const limit = Math.min(Number(req.query.limit) || 50, 200);
-  const offset = Math.max(Number(req.query.offset) || 0, 0);
   const entries = db
     .prepare(`${entrySelect} ${whereSql} ORDER BY e.updated_at DESC, e.id DESC LIMIT ? OFFSET ?`)
     .all(...entryParams(req.user), ...params, limit, offset);
@@ -759,6 +795,22 @@ const canEditEntry = (req) =>
   req.projectRole === 'admin' ||
   (req.projectRole === 'member' && req.entry.created_by === req.user.id);
 
+// Best-effort: (re)compute the English embedding for an entry in the background.
+// Never blocks or fails the request; the backfill script catches any misses.
+function storeEmbedding(entryId, english) {
+  const text = String(english ?? '').trim();
+  if (!text) {
+    db.prepare('UPDATE entries SET embedding = NULL, embedding_model = NULL WHERE id = ?').run(entryId);
+    return;
+  }
+  embed(text)
+    .then((vec) => {
+      db.prepare('UPDATE entries SET embedding = ?, embedding_model = ? WHERE id = ?')
+        .run(toBlob(vec), MODEL, entryId);
+    })
+    .catch((e) => console.error(`[embed] entry ${entryId}:`, e.message));
+}
+
 api.post('/entries', (req, res) => {
   const { project_id, dene_text, english_text, source_doc, notes, category } = req.body ?? {};
   const projectId = Number(project_id);
@@ -786,6 +838,7 @@ api.post('/entries', (req, res) => {
     )
     .run(projectId, kind, dene, english, source_doc?.trim() || null,
          notes?.trim() || null, category?.trim() || null, req.user.id, req.user.id);
+  storeEmbedding(info.lastInsertRowid, english);
   const entry = db
     .prepare(`${entrySelect} WHERE e.id = ?`)
     .get(...entryParams(req.user), info.lastInsertRowid);
@@ -837,6 +890,7 @@ api.patch('/entries/:id', loadEntry, (req, res) => {
     req.user.id,
     req.entry.id
   );
+  if (nextEnglish !== req.entry.english_text) storeEmbedding(req.entry.id, nextEnglish);
   res.json(
     db.prepare(`${entrySelect} WHERE e.id = ?`).get(...entryParams(req.user), req.entry.id)
   );
@@ -872,6 +926,7 @@ api.post('/entries/:id/translate', loadEntry, (req, res) => {
   if (incomplete && nextDene && nextEnglish) {
     logWork({ userId: req.user.id, projectId: req.entry.project_id, type: 'translation', entryId: req.entry.id });
   }
+  if (nextEnglish !== req.entry.english_text) storeEmbedding(req.entry.id, nextEnglish);
   res.json(db.prepare(`${entrySelect} WHERE e.id = ?`).get(...entryParams(req.user), req.entry.id));
 });
 

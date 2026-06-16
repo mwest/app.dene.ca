@@ -793,7 +793,7 @@ async function renderCompensationDetail(id) {
 // Entries list view
 // ---------------------------------------------------------------------------
 
-const listState = { kind: 'word', q: '', has_audio: '', contributor: '', status: '', incomplete: '', offset: 0 };
+const listState = { kind: 'word', q: '', semantic: false, has_audio: '', contributor: '', status: '', incomplete: '', offset: 0 };
 
 async function renderEntries(kind = 'word') {
   const isPhrase = kind === 'phrase';
@@ -824,6 +824,8 @@ async function renderEntries(kind = 'word') {
     </div>
     <div class="filters">
       <input type="search" id="f-q" placeholder="Search Dene or English text…" value="${esc(listState.q)}">
+      <label class="smart-toggle" title="Rank by meaning, not just matching words">
+        <input type="checkbox" id="f-semantic" ${listState.semantic ? 'checked' : ''}> Smart search</label>
       <select id="f-audio">
         <option value="">Audio: any</option>
         <option value="yes" ${listState.has_audio === 'yes' ? 'selected' : ''}>Has audio</option>
@@ -856,6 +858,7 @@ async function renderEntries(kind = 'word') {
   for (const [id, key] of [['#f-audio', 'has_audio'], ['#f-contributor', 'contributor'], ['#f-status', 'status'], ['#f-incomplete', 'incomplete']]) {
     $(id)?.addEventListener('change', (e) => { listState[key] = e.target.value; listState.offset = 0; loadEntryList(); });
   }
+  $('#f-semantic')?.addEventListener('change', (e) => { listState.semantic = e.target.checked; listState.offset = 0; loadEntryList(); });
 
   await loadEntryList();
 }
@@ -881,6 +884,7 @@ async function loadEntryList() {
   if (ap) params.set('project_id', String(ap.id));
   params.set('kind', listState.kind);
   if (listState.q) params.set('q', listState.q);
+  if (listState.semantic && listState.q) params.set('semantic', '1');
   if (listState.has_audio) params.set('has_audio', listState.has_audio);
   if (listState.contributor) params.set('contributor', listState.contributor);
   if (listState.status) params.set('status', listState.status);

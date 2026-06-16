@@ -31,12 +31,27 @@ if [ ! -f "$KEY" ] || [ ! -f "$KEY-cert.pub" ] || find "$KEY-cert.pub" -mmin +36
   chmod 600 "$KEY" "$KEY-cert.pub"
 fi
 
-# 2. Ensure the proxy tunnel is up on $PORT (idempotent: skip if already bound).
+# 2. Ensure the proxy tunnel is up on $PORT. If we start it, tear it down when
+#    this script exits — a lingering `fly proxy` keeps a non-interactive caller's
+#    process group open indefinitely (the command finishes but the task never
+#    "completes"). Reuse an already-running proxy and leave it alone.
 proxy_up() { (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; }
+PROXY_PID=""
 if ! proxy_up; then
-  ( "$FLY" proxy "$PORT:22" -a "$APP" >"/tmp/fly-proxy-$APP.log" 2>&1 & )
+  "$FLY" proxy "$PORT:22" -a "$APP" >"/tmp/fly-proxy-$APP.log" 2>&1 &
+  PROXY_PID=$!
   for _ in $(seq 1 20); do proxy_up && break; sleep 0.5; done
 fi
+# Kill the native Windows flyctl.exe (an MSYS `kill` of $! does not terminate it,
+# which would leave the proxy — and a non-interactive caller's task — alive).
+cleanup_proxy() {
+  [ -z "$PROXY_PID" ] && return
+  # An MSYS `kill` of $! does not stop the native flyctl.exe; taskkill by image
+  # name does (we only ever run one proxy). Without this the proxy outlives the
+  # script and keeps a non-interactive caller's task open forever.
+  taskkill //F //IM flyctl.exe >/dev/null 2>&1 || kill "$PROXY_PID" 2>/dev/null || true
+}
+trap cleanup_proxy EXIT
 
 # 3. Feed the command(s) over a forced-PTY session; strip CRs from the output.
 if [ "$#" -gt 0 ]; then CMD="$*"; else CMD="$(cat)"; fi

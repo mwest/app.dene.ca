@@ -22,4 +22,6 @@ primary_region = "yyz"   # Toronto: keeps data in Canada
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "512mb"
+  # 1 GB headroom for the local sentence-embedding model (semantic search)
+  # alongside Node + SQLite. Bump to 2 GB if ONNX runs tight.
+  memory = "1024mb"

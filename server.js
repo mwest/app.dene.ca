@@ -4,6 +4,7 @@ import path from 'node:path';
 
 import db from './src/db.js';
 import api from './src/api.js';
+import { backfillEmbeddings } from './scripts/embed-backfill.js';
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(import.meta.dirname, 'public');
@@ -42,4 +43,9 @@ app.listen(PORT, () => {
     console.log('No accounts exist yet. Create the superadmin with:');
     console.log('  npm run create-superadmin -- <email> <name> <password>');
   }
+  // Embed any entries missing an English embedding, in the background. Runs in
+  // the web process (baked model, NODE_ENV=production) so semantic search has
+  // data without a separate/SSH step; idempotent, so it no-ops once caught up.
+  backfillEmbeddings((m) => console.log(`[embed] ${m}`))
+    .catch((e) => console.error('[embed] backfill failed:', e.message));
 });
