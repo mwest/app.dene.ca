@@ -4,7 +4,7 @@ Members-only database of Dene–English translation pairs with audio recordings,
 Dene Voice Project (dene.ca). Implements the PRD in `dene-translation-db-prd.md`:
 projects (dialects/communities), role-based access, translation entries with full Unicode
 Dene orthography support, audio attachments with automatic duration tracking, search and
-filtering, per-project dashboards with progress toward the 100 hr/dialect goal, and
+filtering, per-project dashboards with progress toward the 10 hr/dialect goal, and
 CSV/JSON export for STT/TTS training pipelines.
 
 ## Stack

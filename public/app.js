@@ -272,6 +272,32 @@ $('#change-password-btn').addEventListener('click', () => {
   });
 });
 
+$('#change-name-btn').addEventListener('click', () => {
+  $('#user-menu-dropdown').hidden = true;
+  const m = openModal(`
+    <h2>Change name</h2>
+    <form id="name-form">
+      <label class="field"><span>Your name</span>
+        <input type="text" name="name" required value="${esc(state.me.user.name)}" autocomplete="name" autofocus></label>
+      <p class="error-msg" hidden></p>
+      <div class="form-actions">
+        <button type="submit">Save</button>
+        <button type="button" class="ghost" onclick="document.querySelector('.modal-backdrop').remove()">Cancel</button>
+      </div>
+    </form>`);
+  $('#name-form', m).addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    try {
+      const r = await api('/me/name', { method: 'POST', body: { name: f.name.value } });
+      state.me.user.name = r.name;
+      closeModal();
+      renderTopbar();
+      toast('Name updated');
+    } catch (err) { showFormError(f, err.message); }
+  });
+});
+
 function showFormError(form, msg) {
   const p = $('.error-msg', form);
   if (p) { p.textContent = msg; p.hidden = false; }
@@ -1702,7 +1728,7 @@ function setupTranslateCard(entry) {
 // Dashboard view
 // ---------------------------------------------------------------------------
 
-const TARGET_HOURS = 100; // PRD: 100 hours of transcribed audio per dialect
+const TARGET_HOURS = 10; // hours of transcribed audio per dialect
 
 async function renderDashboard() {
   setActiveNav('dashboard');

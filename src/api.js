@@ -291,6 +291,14 @@ api.post('/me/password', (req, res) => {
   res.json({ ok: true });
 });
 
+// Change your own display name.
+api.post('/me/name', (req, res) => {
+  const name = String(req.body?.name ?? '').trim();
+  if (!name) return bad(res, 'Name is required');
+  db.prepare('UPDATE users SET name = ? WHERE id = ?').run(name, req.user.id);
+  res.json({ ok: true, name });
+});
+
 // ---------------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------------
