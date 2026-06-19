@@ -484,7 +484,10 @@ api.get('/users', requireSuperadmin, (req, res) => {
       `SELECT u.id, u.email, u.name, u.is_superadmin, u.created_at,
               (SELECT COUNT(*) FROM entries e WHERE e.created_by = u.id) AS entry_count,
               (SELECT COUNT(*) FROM audio_files a WHERE a.uploaded_by = u.id) AS audio_count,
-              (SELECT group_concat(p.name || CASE m.role WHEN 'admin' THEN ' (admin)' ELSE '' END, ', ')
+              (SELECT group_concat(p.name || ' (' ||
+                        CASE m.role WHEN 'admin' THEN 'Project admin'
+                                    WHEN 'translator' THEN 'Translator'
+                                    ELSE 'Member' END || ')', ', ')
                  FROM memberships m JOIN projects p ON p.id = m.project_id
                  WHERE m.user_id = u.id) AS memberships
        FROM users u ORDER BY u.is_superadmin DESC, u.name`
@@ -797,10 +800,11 @@ function logWork({ userId, projectId, type, entryId = null, audioId = null }) {
   }
 }
 
-// Translators contribute recordings only — no entry editing even for entries
-// they happen to have created under a previous role.
+// Admins and translators may edit any entry in their project (translators go
+// back through their work log to fix things); members may edit only their own.
 const canEditEntry = (req) =>
   req.projectRole === 'admin' ||
+  req.projectRole === 'translator' ||
   (req.projectRole === 'member' && req.entry.created_by === req.user.id);
 
 // Best-effort: (re)compute the English embedding for an entry in the background.
@@ -1299,8 +1303,11 @@ function totalsFor(userId) {
 
 // Shared by the superadmin detail and a translator's own view.
 const workLogFor = db.prepare(
-  `SELECT w.id, w.type, w.amount_cents, w.note, w.created_at, w.entry_id, p.name AS project_name
-   FROM work_log w LEFT JOIN projects p ON p.id = w.project_id
+  `SELECT w.id, w.type, w.amount_cents, w.note, w.created_at, w.entry_id,
+          p.name AS project_name, e.dene_text, e.english_text
+   FROM work_log w
+   LEFT JOIN projects p ON p.id = w.project_id
+   LEFT JOIN entries e ON e.id = w.entry_id
    WHERE w.user_id = ? ORDER BY w.created_at DESC, w.id DESC`
 );
 const paymentsFor = db.prepare(

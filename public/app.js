@@ -654,6 +654,14 @@ async function renderCompensation() {
   };
 }
 
+// Work-log "Detail" cell: the entry's Dene word (or English if it's blank),
+// linking to the entry's edit form; falls back to the note for adjustments.
+function workEntryCell(w) {
+  if (!w.entry_id) return esc(w.note ?? '');
+  const label = w.dene_text || w.english_text || `entry #${w.entry_id}`;
+  return `<a href="#/entries/${w.entry_id}">${esc(label)}</a>`;
+}
+
 async function renderCompensationDetail(id) {
   setActiveNav('compensation');
   view.innerHTML = `<div class="empty">Loading…</div>`;
@@ -742,7 +750,7 @@ async function renderCompensationDetail(id) {
               <td>${fmtDate(w.created_at)}</td>
               <td>${workLabel[w.type] ?? w.type}</td>
               <td>${esc(w.project_name ?? '—')}</td>
-              <td>${w.entry_id ? `<a href="#/entries/${w.entry_id}">entry #${w.entry_id}</a>` : esc(w.note ?? '')}</td>
+              <td>${workEntryCell(w)}</td>
               <td>${fmtMoney(w.amount_cents)}</td>
             </tr>`).join('')}
         </tbody>
@@ -1040,7 +1048,11 @@ async function renderEntryDetail(id) {
 
   const isPhrase = entry.kind === 'phrase';
   const incomplete = isPhrase && (!entry.dene_text || !entry.english_text);
-  const backHref = isPhrase ? '#/phrases' : '#/entries';
+  // Translators reach entries from their work log and can't see the dictionary
+  // tabs, so send them back there instead.
+  const fromWorkLog = isTranslator();
+  const backHref = fromWorkLog ? '#/earnings' : (isPhrase ? '#/phrases' : '#/entries');
+  const backLabel = fromWorkLog ? 'work log' : (isPhrase ? 'phrases' : 'dictionary');
   setActiveNav(isPhrase ? 'phrases' : 'entries');
   const ro = !entry.can_edit;
   const isAdmin = entry.role === 'admin';
@@ -1091,7 +1103,7 @@ async function renderEntryDetail(id) {
   view.innerHTML = `
     <div class="page-head">
       <h1>${isPhrase ? 'Phrase' : 'Entry'} #${entry.id}</h1>
-      <a class="btn secondary" href="${backHref}">‹ Back to ${isPhrase ? 'phrases' : 'dictionary'}</a>
+      <a class="btn secondary" href="${backHref}">‹ Back to ${backLabel}</a>
     </div>
     <div class="card">
       <form id="entry-form">
@@ -1415,7 +1427,7 @@ async function renderMyEarnings() {
               <td>${fmtDate(w.created_at)}</td>
               <td>${workLabel[w.type] ?? w.type}</td>
               <td>${esc(w.project_name ?? '—')}</td>
-              <td>${w.entry_id ? `entry #${w.entry_id}` : esc(w.note ?? '')}</td>
+              <td>${workEntryCell(w)}</td>
               <td>${fmtMoney(w.amount_cents)}</td>
             </tr>`).join('')}
         </tbody>
@@ -2215,6 +2227,7 @@ function route() {
     if (hash === '#/record') renderRecordSession();
     else if (hash === '#/translate') renderTranslateSession();
     else if (hash === '#/earnings') renderMyEarnings();
+    else if ((m = hash.match(/^#\/entries\/(\d+)$/))) renderEntryDetail(m[1]);
     else if (hash === '#/dashboard') renderTranslatorDashboard();
     else location.hash = '#/dashboard';
     return;
