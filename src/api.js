@@ -7,6 +7,7 @@ import { parseFile } from 'music-metadata';
 
 import db, { AUDIO_DIR, REQUESTS_DIR, roleIn, projectsFor, projectIdsFor } from './db.js';
 import { embed, toBlob, fromBlob, cosine, MODEL } from './embed.js';
+import { backfillEmbeddings } from '../scripts/embed-backfill.js';
 import { APP_URL, inviteEmail, requestFormEmail, requestNotifyEmail, resetEmail, sendMail } from './mail.js';
 import {
   COOKIE_NAME,
@@ -24,6 +25,18 @@ api.use(express.json());
 
 const bad = (res, msg, code = 400) => res.status(code).json({ error: msg });
 
+// Light in-memory rate limit; protects the public, unauthenticated endpoints
+// (login brute force, and the email-sending request/reset flows).
+const rateBuckets = new Map();
+function rateLimited(key, max, windowMs) {
+  const now = Date.now();
+  const hits = (rateBuckets.get(key) ?? []).filter((t) => now - t < windowMs);
+  if (hits.length >= max) { rateBuckets.set(key, hits); return true; }
+  hits.push(now);
+  rateBuckets.set(key, hits);
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Auth
 // ---------------------------------------------------------------------------
@@ -31,6 +44,11 @@ const bad = (res, msg, code = 400) => res.status(code).json({ error: msg });
 api.post('/login', (req, res) => {
   const { email, password } = req.body ?? {};
   if (!email || !password) return bad(res, 'Email and password are required');
+  // Throttle guessing: by IP, and by the targeted account.
+  if (rateLimited(`login-ip:${req.ip}`, 20, 15 * 60 * 1000) ||
+      rateLimited(`login-email:${String(email).trim().toLowerCase()}`, 10, 15 * 60 * 1000)) {
+    return bad(res, 'Too many sign-in attempts — please try again later', 429);
+  }
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(String(email).trim());
   if (!user || !verifyPassword(password, user.password_hash)) {
     return bad(res, 'Invalid email or password', 401);
@@ -86,6 +104,12 @@ async function sendInvite(user, invitedBy, projectName) {
 api.post('/password/forgot', async (req, res) => {
   const email = String(req.body?.email ?? '').trim();
   if (!email) return bad(res, 'Email is required');
+  // Throttle to prevent reset-email bombing of a known address (and cost/quota
+  // abuse). Still answers ok below so addresses can't be probed.
+  if (rateLimited(`forgot-ip:${req.ip}`, 15, 60 * 60 * 1000) ||
+      rateLimited(`forgot-email:${email.toLowerCase()}`, 3, 60 * 60 * 1000)) {
+    return res.json({ ok: true });
+  }
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
   if (user) {
     const link = setPasswordLink(createPasswordToken(user.id, 'reset', 2));
@@ -120,17 +144,6 @@ api.post('/password/reset', (req, res) => {
 // ---------------------------------------------------------------------------
 
 const REQUEST_LINK_HOURS = 7 * 24;
-
-// Light in-memory rate limit; protects the public email-sending endpoint.
-const rateBuckets = new Map();
-function rateLimited(key, max, windowMs) {
-  const now = Date.now();
-  const hits = (rateBuckets.get(key) ?? []).filter((t) => now - t < windowMs);
-  if (hits.length >= max) { rateBuckets.set(key, hits); return true; }
-  hits.push(now);
-  rateBuckets.set(key, hits);
-  return false;
-}
 
 const pruneExpiredRequests = () =>
   db.prepare(
@@ -658,7 +671,10 @@ api.get('/projects/:id/stats', (req, res) => {
 // on that project's entries. Editing/deleting a recording remains restricted
 // to its uploader or a project admin.
 const entrySelect = `
-  SELECT e.*, p.name AS project_name, p.dialect,
+  SELECT e.id, e.project_id, e.kind, e.dene_text, e.english_text, e.source_doc,
+         e.notes, e.category, e.status, e.created_by, e.updated_by,
+         e.created_at, e.updated_at,
+         p.name AS project_name, p.dialect,
          cu.name AS created_by_name, uu.name AS updated_by_name,
          (SELECT COUNT(*) FROM audio_files a WHERE a.entry_id = e.id) AS audio_count,
          (SELECT COALESCE(SUM(a.duration_seconds), 0) FROM audio_files a
@@ -949,6 +965,13 @@ api.post('/entries/:id/translate', loadEntry, (req, res) => {
 const AUDIO_EXTS = new Set(['.wav', '.mp3', '.m4a']);
 const MAX_AUDIO_BYTES = 500 * 1024 * 1024; // 500 MB
 
+// Content-Type served for a recording is derived from its (server-generated)
+// extension, never from the client-supplied upload MIME — a spoofed type like
+// text/html served inline would otherwise execute as script on this origin.
+const AUDIO_MIME = { '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4' };
+const audioMimeFor = (storedName) =>
+  AUDIO_MIME[path.extname(storedName).toLowerCase()] || 'application/octet-stream';
+
 const upload = multer({
   storage: multer.diskStorage({
     // Files are organized per uploader: data/audio/<userID>/<file>
@@ -1066,8 +1089,9 @@ api.get('/audio/:id/stream', loadAudio, (req, res) => {
   // Any member of the entry's project can listen (loadAudio enforces membership).
   res.sendFile(path.join(AUDIO_DIR, req.audio.stored_name), {
     headers: {
-      'Content-Type': req.audio.mime_type,
+      'Content-Type': audioMimeFor(req.audio.stored_name),
       'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(req.audio.original_name)}`,
+      'X-Content-Type-Options': 'nosniff',
     },
   });
 });
@@ -1278,6 +1302,13 @@ api.post('/projects/:id/import', requireSuperadmin, (req, res, next) => {
       imported++;
     }
   })();
+
+  // Imported rows have no embeddings yet — embed them in the background so
+  // semantic ("Smart") search works without waiting for a server restart.
+  if (imported > 0) {
+    backfillEmbeddings((m) => console.log('[embed:import]', m))
+      .catch((e) => console.error('[embed:import] backfill failed:', e.message));
+  }
 
   res.json({
     ok: true,
