@@ -718,11 +718,23 @@ api.get('/entries', async (req, res) => {
     where.push('e.created_by = ?');
     params.push(Number(req.query.contributor));
   }
-  // All project members can see every recording.
+  // has_audio filters on whether ANY user has recorded the entry — useful for
+  // admin/list views. All project members can see every recording.
   if (req.query.has_audio === 'yes') {
     where.push('EXISTS (SELECT 1 FROM audio_files a WHERE a.entry_id = e.id)');
   } else if (req.query.has_audio === 'no') {
     where.push('NOT EXISTS (SELECT 1 FROM audio_files a WHERE a.entry_id = e.id)');
+  }
+  // needs_my_audio builds a per-speaker recording queue: entries THIS user has
+  // not yet recorded in the given language. One speaker recording an entry does
+  // not remove it from another speaker's queue, and Dene/English are independent.
+  const needsMine = req.query.needs_my_audio;
+  if (needsMine === 'dene' || needsMine === 'english') {
+    where.push(
+      `NOT EXISTS (SELECT 1 FROM audio_files a
+                   WHERE a.entry_id = e.id AND a.uploaded_by = ? AND a.language = ?)`
+    );
+    params.push(req.user.id, needsMine);
   }
   if (req.query.status) {
     where.push('e.status = ?');
