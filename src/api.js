@@ -862,6 +862,17 @@ function storeEmbedding(entryId, english) {
     .catch((e) => console.error(`[embed] entry ${entryId}:`, e.message));
 }
 
+// Write both sides of an entry and refresh its embedding. Shared by the legacy
+// /translate endpoint and the work-item submit path. Synchronous (safe inside a
+// transaction): storeEmbedding only schedules async work, it never awaits here.
+function applyTranslation(entry, nextDene, nextEnglish, userId) {
+  db.prepare(
+    `UPDATE entries SET dene_text = ?, english_text = ?, updated_by = ?, updated_at = datetime('now')
+     WHERE id = ?`
+  ).run(nextDene, nextEnglish, userId, entry.id);
+  if (nextEnglish !== entry.english_text) storeEmbedding(entry.id, nextEnglish);
+}
+
 api.post('/entries', (req, res) => {
   const { project_id, dene_text, english_text, source_doc, notes, category } = req.body ?? {};
   const projectId = Number(project_id);
@@ -969,15 +980,11 @@ api.post('/entries/:id/translate', loadEntry, (req, res) => {
   const nextDene = dene_text !== undefined ? String(dene_text).trim() : req.entry.dene_text;
   const nextEnglish = english_text !== undefined ? String(english_text).trim() : req.entry.english_text;
   if (!nextDene && !nextEnglish) return bad(res, 'Enter a Dene phrase or an English meaning');
-  db.prepare(
-    `UPDATE entries SET dene_text = ?, english_text = ?, updated_by = ?, updated_at = datetime('now')
-     WHERE id = ?`
-  ).run(nextDene, nextEnglish, req.user.id, req.entry.id);
+  applyTranslation(req.entry, nextDene, nextEnglish, req.user.id);
   // Bill the translation when this fills the last missing side (incomplete → complete).
   if (incomplete && nextDene && nextEnglish) {
     logWork({ userId: req.user.id, projectId: req.entry.project_id, type: 'translation', entryId: req.entry.id });
   }
-  if (nextEnglish !== req.entry.english_text) storeEmbedding(req.entry.id, nextEnglish);
   res.json(db.prepare(`${entrySelect} WHERE e.id = ?`).get(...entryParams(req.user), req.entry.id));
 });
 
@@ -1041,6 +1048,21 @@ async function probeAudio(filePath) {
   return duration;
 }
 
+// Insert a new audio_files row and return its id. Shared by the legacy /audio
+// upsert (its create branch) and the work-item recording submit. Never mutates
+// an existing row — re-records that replace a file stay in the legacy path.
+function insertAudioRow({ entryId, userId, storedName, originalName, mime, size, duration, language, speaker, notes }) {
+  return db
+    .prepare(
+      `INSERT INTO audio_files
+         (entry_id, stored_name, original_name, mime_type, size_bytes, duration_seconds,
+          language, speaker, recording_notes, uploaded_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(entryId, storedName, originalName, mime, size, duration, language, speaker, notes, userId)
+    .lastInsertRowid;
+}
+
 // Upsert: each user has at most one recording per language per entry, so a new
 // upload for the same language replaces their previous one.
 api.post('/entries/:id/audio', loadEntry, audioUpload, async (req, res) => {
@@ -1081,15 +1103,10 @@ api.post('/entries/:id/audio', loadEntry, audioUpload, async (req, res) => {
     fs.rm(path.join(AUDIO_DIR, existing.stored_name), { force: true }, () => {});
     id = existing.id;
   } else {
-    id = db
-      .prepare(
-        `INSERT INTO audio_files
-           (entry_id, stored_name, original_name, mime_type, size_bytes, duration_seconds,
-            language, speaker, recording_notes, uploaded_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(req.entry.id, storedName, req.file.originalname, mime, req.file.size,
-           duration, language, speaker, notes, req.user.id).lastInsertRowid;
+    id = insertAudioRow({
+      entryId: req.entry.id, userId: req.user.id, storedName, originalName: req.file.originalname,
+      mime, size: req.file.size, duration, language, speaker, notes,
+    });
     // Bill the recording once, on first creation (re-records reuse the row).
     logWork({ userId: req.user.id, projectId: req.entry.project_id, type: 'recording', entryId: req.entry.id, audioId: id });
   }
@@ -1138,6 +1155,224 @@ api.delete('/audio/:id', loadAudio, (req, res) => {
   }
   db.prepare('DELETE FROM audio_files WHERE id = ?').run(req.audio.id);
   fs.rm(path.join(AUDIO_DIR, req.audio.stored_name), { force: true }, () => {});
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// Work items (#3/#4): claimable, leased units of paid work with a transactional
+// submit-and-bill. Sessions claim a small batch, then submit or release each.
+// Under the current auto-accept policy, submit == accept in one transaction.
+// ---------------------------------------------------------------------------
+
+const LEASE_MINUTES = 45;
+const MAX_CLAIM = 20;
+
+function loadWorkItem(req, res, next) {
+  const item = db.prepare('SELECT * FROM work_items WHERE id = ?').get(req.params.id);
+  if (!item) return bad(res, 'Work item not found', 404);
+  const role = roleIn(req.user, item.project_id);
+  if (!role) return bad(res, 'Not a member of this project', 403);
+  if (item.assigned_to !== req.user.id && role !== 'admin') {
+    return bad(res, 'This work item is not assigned to you', 403);
+  }
+  req.workItem = item;
+  req.projectRole = role;
+  next();
+}
+
+// Insert the ledger row for an accepted work item, snapshotting the rate at
+// accept time (matching the legacy "rate at time of work" invariant). Idempotent:
+// the unique index on work_log(work_item_id) makes a repeat a silent no-op, so a
+// double-submit can never double-bill. Runs inside the caller's transaction.
+function billWorkItem(item, { entryId = null, audioId = null }) {
+  const rate = db
+    .prepare('SELECT rate_cents FROM translator_rates WHERE user_id = ? AND project_id = ? AND type = ?')
+    .get(item.assigned_to, item.project_id, item.type);
+  db.prepare(
+    `INSERT INTO work_log (user_id, project_id, type, entry_id, audio_id, amount_cents, work_item_id, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(work_item_id) WHERE work_item_id IS NOT NULL DO NOTHING`
+  ).run(item.assigned_to, item.project_id, item.type, entryId, audioId,
+        rate?.rate_cents ?? 0, item.id, item.assigned_to);
+}
+
+const acceptWorkItem = (id) =>
+  db.prepare(
+    `UPDATE work_items SET status = 'accepted', submitted_at = datetime('now'),
+       reviewed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`
+  ).run(id);
+
+// Session-friendly response: the work item plus the entry (translation) or the
+// current recording for its slot (recording).
+function submitResult(item) {
+  const out = { ok: true, work_item_id: item.id, type: item.type, status: item.status };
+  if (item.type === 'translation') {
+    out.entry = db.prepare(`${entrySelect} WHERE e.id = ?`).get(...entryParams(item), item.entry_id);
+  } else {
+    out.audio = db
+      .prepare('SELECT * FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ? ORDER BY id DESC')
+      .get(item.entry_id, item.assigned_to, item.language);
+  }
+  return out;
+}
+
+// Claim a batch of work. Runs as ONE synchronous transaction (no awaits) so
+// concurrent claims cannot hand the same job to two people; the partial unique
+// indexes are a backstop for that invariant and the future admin-reassign flow.
+api.post('/projects/:id/work/claim', (req, res) => {
+  const projectId = Number(req.params.id);
+  const role = roleIn(req.user, projectId);
+  if (!role) return bad(res, 'Not a member of this project', 403);
+  const type = req.body?.type;
+  if (type !== 'translation' && type !== 'recording') return bad(res, 'Invalid work type');
+  const language = type === 'recording' ? (req.body?.language === 'english' ? 'english' : 'dene') : null;
+  const limit = Math.min(Math.max(Number(req.body?.limit) || 10, 1), MAX_CLAIM);
+
+  // Lease window; a short lease is allowed outside production to exercise expiry.
+  let leaseExpr = `datetime('now', '+${LEASE_MINUTES} minutes')`;
+  if (process.env.NODE_ENV !== 'production' && req.body?._test_lease_seconds !== undefined) {
+    const secs = Number(req.body._test_lease_seconds) || 0;
+    leaseExpr = `datetime('now', '${secs < 0 ? '-' : '+'}${Math.abs(secs)} seconds')`;
+  }
+
+  const rateCents = db
+    .prepare('SELECT rate_cents FROM translator_rates WHERE user_id = ? AND project_id = ? AND type = ?')
+    .get(req.user.id, projectId, type)?.rate_cents ?? null;
+
+  const claimedIds = db.transaction(() => {
+    // Free any of this user-independent pool's leases that have lapsed.
+    db.prepare(
+      `UPDATE work_items SET status = 'cancelled', updated_at = datetime('now')
+       WHERE project_id = ? AND type = ? AND status = 'claimed' AND lease_expires_at < datetime('now')`
+    ).run(projectId, type);
+
+    let candidates;
+    if (type === 'translation') {
+      candidates = db
+        .prepare(
+          `SELECT e.id FROM entries e
+           WHERE e.project_id = ? AND e.kind = 'phrase'
+             AND (e.dene_text = '' OR e.english_text = '')
+             AND NOT EXISTS (SELECT 1 FROM work_items w WHERE w.entry_id = e.id
+                               AND w.type = 'translation' AND w.status IN ('claimed', 'submitted'))
+           ORDER BY e.updated_at DESC, e.id DESC LIMIT ?`
+        )
+        .all(projectId, limit);
+    } else {
+      candidates = db
+        .prepare(
+          `SELECT e.id FROM entries e
+           WHERE e.project_id = ? AND e.dene_text <> '' AND e.english_text <> ''
+             AND NOT EXISTS (SELECT 1 FROM audio_files a WHERE a.entry_id = e.id
+                               AND a.uploaded_by = ? AND a.language = ?)
+             AND NOT EXISTS (SELECT 1 FROM work_items w WHERE w.entry_id = e.id
+                               AND w.type = 'recording' AND w.language = ? AND w.assigned_to = ?
+                               AND w.status IN ('claimed', 'submitted'))
+           ORDER BY e.updated_at DESC, e.id DESC LIMIT ?`
+        )
+        .all(projectId, req.user.id, language, language, req.user.id, limit);
+    }
+
+    const ins = db.prepare(
+      `INSERT INTO work_items (project_id, entry_id, type, language, assigned_to, status, rate_cents, claimed_at, lease_expires_at)
+       VALUES (?, ?, ?, ?, ?, 'claimed', ?, datetime('now'), ${leaseExpr})`
+    );
+    return candidates.map((c) => ins.run(projectId, c.id, type, language, req.user.id, rateCents).lastInsertRowid);
+  })();
+
+  if (!claimedIds.length) return res.json({ items: [] });
+  const items = db
+    .prepare(`SELECT * FROM work_items WHERE id IN (${claimedIds.map(() => '?').join(',')})`)
+    .all(...claimedIds);
+  const entryIds = items.map((i) => i.entry_id);
+  const entryRows = db
+    .prepare(`${entrySelect} WHERE e.id IN (${entryIds.map(() => '?').join(',')})`)
+    .all(...entryParams(req.user), ...entryIds);
+  const byId = new Map(entryRows.map((r) => [r.id, r]));
+  const out = items.map((i) => ({
+    work_item_id: i.id, type: i.type, language: i.language,
+    lease_expires_at: i.lease_expires_at, entry: byId.get(i.entry_id),
+  }));
+  res.json({ items: out });
+});
+
+// Submit a claimed work item; auto-accepts and bills in one transaction.
+api.post('/work/:id/submit', loadWorkItem, (req, res) => {
+  const item = req.workItem;
+  if (item.status === 'accepted') return res.json(submitResult(item)); // idempotent replay
+  if (item.status !== 'claimed') return bad(res, 'This work item is no longer active', 409);
+
+  const entry = db.prepare('SELECT * FROM entries WHERE id = ?').get(item.entry_id);
+  if (!entry) return bad(res, 'Entry not found', 404);
+
+  if (item.type === 'translation') {
+    const incomplete = entry.dene_text === '' || entry.english_text === '';
+    // Stale-claim guard: if the phrase was completed by someone else (or an admin
+    // via the legacy path) while this claim was held, don't apply or bill.
+    if (!incomplete) {
+      db.prepare(`UPDATE work_items SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?`).run(item.id);
+      return bad(res, 'This phrase was already completed by someone else', 409);
+    }
+    const { dene_text, english_text } = req.body ?? {};
+    const nextDene = dene_text !== undefined ? String(dene_text).trim() : entry.dene_text;
+    const nextEnglish = english_text !== undefined ? String(english_text).trim() : entry.english_text;
+    if (!nextDene || !nextEnglish) return bad(res, 'Enter both a Dene phrase and an English meaning to complete it');
+    db.transaction(() => {
+      applyTranslation(entry, nextDene, nextEnglish, req.user.id);
+      acceptWorkItem(item.id);
+      billWorkItem(item, { entryId: entry.id });
+    })();
+    return res.json(submitResult(db.prepare('SELECT * FROM work_items WHERE id = ?').get(item.id)));
+  }
+
+  // recording: multipart upload
+  audioUpload(req, res, async () => {
+    if (!req.file) return bad(res, 'No audio file provided');
+    const filePath = req.file.path;
+    if (entry.dene_text === '' || entry.english_text === '') {
+      fs.rm(filePath, { force: true }, () => {});
+      return bad(res, 'Add the translation before recording this phrase');
+    }
+    const language = item.language === 'english' ? 'english' : 'dene';
+    let duration;
+    try {
+      duration = await probeAudio(filePath); // before the transaction — no awaits inside it
+    } catch {
+      fs.rm(filePath, { force: true }, () => {});
+      return bad(res, 'Could not read that audio file — it may be corrupt or in an unsupported format. Nothing was changed.');
+    }
+    const storedName = `${req.user.id}/${req.file.filename}`;
+    const mime = req.file.mimetype || 'application/octet-stream';
+    const speaker = req.body.speaker?.trim() || null;
+    const notes = req.body.recording_notes?.trim() || null;
+    // Bill-once: if this speaker already has a recording for this slot (e.g. they
+    // recorded it on the entry page mid-session), accept the claim without a
+    // duplicate row or a second ledger entry.
+    const existing = db
+      .prepare('SELECT id FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ?')
+      .get(entry.id, req.user.id, language);
+    db.transaction(() => {
+      if (existing) {
+        acceptWorkItem(item.id);
+      } else {
+        const audioId = insertAudioRow({
+          entryId: entry.id, userId: req.user.id, storedName, originalName: req.file.originalname,
+          mime, size: req.file.size, duration, language, speaker, notes,
+        });
+        acceptWorkItem(item.id);
+        billWorkItem(item, { audioId });
+      }
+    })();
+    if (existing) fs.rm(filePath, { force: true }, () => {}); // discard the duplicate upload
+    return res.json(submitResult(db.prepare('SELECT * FROM work_items WHERE id = ?').get(item.id)));
+  });
+});
+
+// Release a still-claimed item back to the queue (Skip / Exit a session).
+api.post('/work/:id/release', loadWorkItem, (req, res) => {
+  if (req.workItem.status === 'claimed') {
+    db.prepare(`UPDATE work_items SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?`).run(req.workItem.id);
+  }
   res.json({ ok: true });
 });
 

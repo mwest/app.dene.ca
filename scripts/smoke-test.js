@@ -314,6 +314,96 @@ await member.req('DELETE', `/api/audio/${englishAudioId}`);
 await member2.req('DELETE', `/api/audio/${member2AudioId}`);
 await translator.req('DELETE', `/api/audio/${translatorAudioId}`);
 
+// --- work items: claiming, leases, transactional billing (#3/#4) ---
+// Dedicated project so the candidate sets are controlled and stats above are untouched.
+r = await sa.req('POST', '/api/projects', { name: pname + ' WI', dialect: 'x' });
+const wiProj = r.data.id;
+const aEmail = `wi-a-${Date.now()}@test.ca`;
+const bEmail = `wi-b-${Date.now()}@test.ca`;
+r = await sa.req('POST', `/api/projects/${wiProj}/members`, { email: aEmail, name: 'WI A', password: 'wi-a-pass-1', role: 'translator' });
+const aId = r.data.user_id;
+r = await sa.req('POST', `/api/projects/${wiProj}/members`, { email: bEmail, name: 'WI B', password: 'wi-b-pass-1', role: 'translator' });
+const bId = r.data.user_id;
+const A = client(), B = client();
+await A.req('POST', '/api/login', { email: aEmail, password: 'wi-a-pass-1' });
+await B.req('POST', '/api/login', { email: bEmail, password: 'wi-b-pass-1' });
+// rates so accepted work bills a known, testable amount
+await sa.req('PUT', `/api/compensation/${aId}/rates`, { project_id: wiProj, type: 'translation', rate_cents: 500 });
+await sa.req('PUT', `/api/compensation/${aId}/rates`, { project_id: wiProj, type: 'recording', rate_cents: 300 });
+const claim = (c, body) => c.req('POST', `/api/projects/${wiProj}/work/claim`, body);
+const itemFor = (resp, entryId) => resp.data.items.find((i) => i.entry.id === entryId);
+
+// (1) atomic single-claim: one incomplete phrase, two translators claim, exactly one wins
+r = await sa.req('POST', '/api/entries', { project_id: wiProj, kind: 'phrase', dene_text: 'sǫ́ba', english_text: '' });
+const onePhrase = r.data.id;
+const ca = await claim(A, { type: 'translation', limit: 20 });
+const cb = await claim(B, { type: 'translation', limit: 20 });
+const aGot = !!itemFor(ca, onePhrase), bGot = !!itemFor(cb, onePhrase);
+check('atomic claim: exactly one translator gets the sole phrase', aGot !== bGot, JSON.stringify([aGot, bGot]));
+const holder = aGot ? A : B, holderId = aGot ? aId : bId;
+const oneWi = itemFor(aGot ? ca : cb, onePhrase).work_item_id;
+
+// (3) idempotent double-submit + (bill exactly once)
+let s = await holder.req('POST', `/api/work/${oneWi}/submit`, { english_text: 'money' });
+check('translation submit accepted + applied', s.status === 200 && s.data.entry.english_text === 'money', JSON.stringify(s.data));
+s = await holder.req('POST', `/api/work/${oneWi}/submit`, { english_text: 'money-again' });
+check('idempotent re-submit: no re-apply', s.status === 200 && s.data.entry.english_text === 'money');
+r = await sa.req('GET', `/api/compensation/${holderId}`);
+let trans = r.data.work.filter((w) => w.type === 'translation' && w.entry_id === onePhrase);
+check('translation billed exactly once at the snapshot rate', trans.length === 1 && trans[0].amount_cents === 500, JSON.stringify(trans));
+
+// (5) applied on accept + no longer offered
+r = await sa.req('GET', `/api/entries/${onePhrase}`);
+check('accepted translation is on the entry', r.data.english_text === 'money' && r.data.dene_text === 'sǫ́ba');
+check('completed phrase no longer offered', !itemFor(await claim(holder, { type: 'translation', limit: 20 }), onePhrase));
+
+// (2) expired-claim reclaim + (8) stale-claim submit is safe
+r = await sa.req('POST', '/api/entries', { project_id: wiProj, kind: 'phrase', dene_text: "k'ǫ", english_text: '' });
+const expPhrase = r.data.id;
+const aExp = await claim(A, { type: 'translation', limit: 20, _test_lease_seconds: -1 });
+const aExpWi = itemFor(aExp, expPhrase).work_item_id;
+const bExp = await claim(B, { type: 'translation', limit: 20 });
+check('expired claim is reclaimable by another user', !!itemFor(bExp, expPhrase), JSON.stringify(bExp.data.items.map((i) => i.entry.id)));
+await B.req('POST', `/api/work/${itemFor(bExp, expPhrase).work_item_id}/submit`, { english_text: 'fire' });
+const stale = await A.req('POST', `/api/work/${aExpWi}/submit`, { english_text: 'STOLEN' });
+check('stale-claim submit rejected (409), not applied', stale.status === 409);
+r = await sa.req('GET', `/api/entries/${expPhrase}`);
+check('stale submit did not overwrite the entry', r.data.english_text === 'fire');
+r = await sa.req('GET', `/api/compensation/${aId}`);
+check('stale submit did not bill A', r.data.work.filter((w) => w.type === 'translation' && w.entry_id === expPhrase).length === 0);
+
+// (7) release re-opens immediately
+r = await sa.req('POST', '/api/entries', { project_id: wiProj, kind: 'phrase', dene_text: 'tsá', english_text: '' });
+const relPhrase = r.data.id;
+const relWi = itemFor(await claim(A, { type: 'translation', limit: 20 }), relPhrase).work_item_id;
+await A.req('POST', `/api/work/${relWi}/release`);
+check('released item is immediately re-claimable', !!itemFor(await claim(B, { type: 'translation', limit: 20 }), relPhrase));
+
+// (6) per-speaker recording + (4) no double-bill on legacy re-record
+r = await sa.req('POST', '/api/entries', { project_id: wiProj, dene_text: 'dlǫ', english_text: 'squirrel' });
+const recEntry = r.data.id;
+const aRecWi = itemFor(await claim(A, { type: 'recording', language: 'dene', limit: 20 }), recEntry).work_item_id;
+const bRecWi = itemFor(await claim(B, { type: 'recording', language: 'dene', limit: 20 }), recEntry).work_item_id;
+check('both speakers get their own recording item for the same entry', !!aRecWi && !!bRecWi && aRecWi !== bRecWi);
+let fd2 = new FormData(); fd2.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'a-rec.wav');
+const ra = await A.req('POST', `/api/work/${aRecWi}/submit`, fd2, true);
+fd2 = new FormData(); fd2.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'b-rec.wav');
+const rb = await B.req('POST', `/api/work/${bRecWi}/submit`, fd2, true);
+check('both recording submits accepted', ra.status === 200 && rb.status === 200, JSON.stringify([ra.status, rb.status]));
+r = await sa.req('GET', `/api/entries/${recEntry}`);
+check('two recordings on the entry (per-speaker)', r.data.audio.length === 2, JSON.stringify(r.data.audio.length));
+r = await sa.req('GET', `/api/compensation/${aId}`);
+check('A billed exactly one recording at the snapshot rate',
+  r.data.work.filter((w) => w.type === 'recording').length === 1 &&
+  r.data.work.find((w) => w.type === 'recording').amount_cents === 300);
+fd2 = new FormData(); fd2.append('file', new Blob([makeWav(2)], { type: 'audio/wav' }), 'a-rec-v2.wav'); fd2.append('language', 'dene');
+r = await A.req('POST', `/api/entries/${recEntry}/audio`, fd2, true);
+check('legacy re-record replaces the file', r.status === 200 && r.data.replaced === true);
+r = await sa.req('GET', `/api/compensation/${aId}`);
+check('re-record did not add a second recording bill', r.data.work.filter((w) => w.type === 'recording').length === 1);
+
+await sa.req('DELETE', `/api/projects/${wiProj}`, { confirm_name: pname + ' WI' });
+
 // --- stats & export ---
 r = await sa.req('GET', `/api/projects/${projectId}/stats`);
 check('project stats: entries + audio seconds', r.status === 200 &&
