@@ -44,9 +44,13 @@ function rateLimited(key, max, windowMs) {
 api.post('/login', (req, res) => {
   const { email, password } = req.body ?? {};
   if (!email || !password) return bad(res, 'Email and password are required');
-  // Throttle guessing: by IP, and by the targeted account.
-  if (rateLimited(`login-ip:${req.ip}`, 20, 15 * 60 * 1000) ||
-      rateLimited(`login-email:${String(email).trim().toLowerCase()}`, 10, 15 * 60 * 1000)) {
+  // The per-EMAIL cap is the real brute-force defense: it bounds guesses against
+  // any single account regardless of source. The per-IP cap only guards against
+  // one host hammering many accounts, so it's set generously — community users
+  // often share one public IP (a school or band office signing in together), and
+  // a tight per-IP cap would lock the whole room out during group onboarding.
+  if (rateLimited(`login-email:${String(email).trim().toLowerCase()}`, 10, 15 * 60 * 1000) ||
+      rateLimited(`login-ip:${req.ip}`, 100, 15 * 60 * 1000)) {
     return bad(res, 'Too many sign-in attempts — please try again later', 429);
   }
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(String(email).trim());
@@ -104,10 +108,13 @@ async function sendInvite(user, invitedBy, projectName) {
 api.post('/password/forgot', async (req, res) => {
   const email = String(req.body?.email ?? '').trim();
   if (!email) return bad(res, 'Email is required');
-  // Throttle to prevent reset-email bombing of a known address (and cost/quota
-  // abuse). Still answers ok below so addresses can't be probed.
-  if (rateLimited(`forgot-ip:${req.ip}`, 15, 60 * 60 * 1000) ||
-      rateLimited(`forgot-email:${email.toLowerCase()}`, 3, 60 * 60 * 1000)) {
+  // The per-EMAIL cap prevents reset-email bombing of a known address (and the
+  // Resend cost that comes with it) — that's the real abuse to stop, so it stays
+  // tight. The per-IP cap is only shared-host collateral protection, so it's set
+  // generously to avoid locking out a shared office/school connection. Still
+  // answers ok below so addresses can't be probed.
+  if (rateLimited(`forgot-email:${email.toLowerCase()}`, 3, 60 * 60 * 1000) ||
+      rateLimited(`forgot-ip:${req.ip}`, 50, 60 * 60 * 1000)) {
     return res.json({ ok: true });
   }
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
