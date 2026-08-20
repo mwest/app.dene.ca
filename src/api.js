@@ -816,11 +816,15 @@ function logWork({ userId, projectId, type, entryId = null, audioId = null }) {
   }
 }
 
-// Admins and translators may edit any entry in their project (translators go
-// back through their work log to fix things); members may edit only their own.
+// Project admins may edit any entry; members may edit only their own. UI hiding
+// is not authorization, so this is the server-side gate for generic entry edits
+// and deletes. Translators are intentionally NOT granted general edit rights:
+// their work goes through the dedicated /translate endpoint (completing an
+// incomplete phrase) and their own recordings — not arbitrary entry edits.
+// Corrections to completed work are handled by an admin, or (once work items
+// land) by reopening the translator's own claimed work item.
 const canEditEntry = (req) =>
   req.projectRole === 'admin' ||
-  req.projectRole === 'translator' ||
   (req.projectRole === 'member' && req.entry.created_by === req.user.id);
 
 // Best-effort: (re)compute the English embedding for an entry in the background.

@@ -266,6 +266,9 @@ check('translator cannot create entries', r.status === 403);
 r = await translator.req('PATCH', `/api/entries/${entryId}`, { english_text: 'nope' });
 check('translator cannot edit entries', r.status === 403);
 
+r = await translator.req('DELETE', `/api/entries/${entryId}`);
+check('translator cannot delete entries', r.status === 403);
+
 r = await translator.req('GET', `/api/entries?project_id=${projectId}&has_audio=no`);
 check('translator lists entries without audio (recording queue)', r.status === 200 &&
   r.data.entries.every((e) => e.audio_count === 0), JSON.stringify(r.data.total));
