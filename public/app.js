@@ -111,17 +111,50 @@ function isTranslator() {
 }
 
 // ---------------------------------------------------------------------------
-// Microphone recorder — captures raw PCM and encodes MP3 with lamejs
+// Microphone recorder — captures raw PCM and saves a lossless 16-bit PCM WAV
+// master. The WAV is the source of truth; lossy playback/training derivatives
+// are generated server-side from it (see change #8). We deliberately do NOT
+// encode to MP3 in the browser: that permanently discards source quality.
 // ---------------------------------------------------------------------------
+
+// Build a mono 16-bit PCM WAV Blob (RIFF/WAVE) from Int16 samples.
+function encodeWavPcm16(int16, sampleRate) {
+  const dataSize = int16.length * 2;
+  const buf = new ArrayBuffer(44 + dataSize);
+  const dv = new DataView(buf);
+  const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+  writeStr(0, 'RIFF'); dv.setUint32(4, 36 + dataSize, true); writeStr(8, 'WAVE');
+  writeStr(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); // PCM
+  dv.setUint16(22, 1, true);                    // mono
+  dv.setUint32(24, sampleRate, true);           // sample rate
+  dv.setUint32(28, sampleRate * 2, true);       // byte rate = rate * blockAlign
+  dv.setUint16(32, 2, true);                    // block align (mono * 16-bit)
+  dv.setUint16(34, 16, true);                   // bits per sample
+  writeStr(36, 'data'); dv.setUint32(40, dataSize, true);
+  let off = 44;
+  for (let i = 0; i < int16.length; i++) { dv.setInt16(off, int16[i], true); off += 2; }
+  return new Blob([buf], { type: 'audio/wav' });
+}
 
 const Recorder = {
   session: null,
 
   async start() {
+    // Ask for unprocessed capture; browsers may ignore some constraints, so we
+    // record the sample rate the capture chain actually used (from the context).
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: false, noiseSuppression: false },
+      audio: {
+        channelCount: 1,
+        sampleRate: { ideal: 48000 },
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
     });
-    const ctx = new AudioContext();
+    // Prefer a 48 kHz context where supported; fall back to the device default.
+    let ctx;
+    try { ctx = new AudioContext({ sampleRate: 48000 }); }
+    catch { ctx = new AudioContext(); }
     const source = ctx.createMediaStreamSource(stream);
     const proc = ctx.createScriptProcessor(4096, 1, 1);
     const chunks = [];
@@ -143,7 +176,7 @@ const Recorder = {
     return { chunks: s.chunks, sampleRate };
   },
 
-  /** Stop and return an MP3 Blob. */
+  /** Stop and return a lossless mono 16-bit PCM WAV Blob. */
   async stop() {
     const rec = await this.teardown();
     if (!rec) return null;
@@ -156,15 +189,7 @@ const Recorder = {
         samples[off++] = v < 0 ? v * 0x8000 : v * 0x7fff;
       }
     }
-    const encoder = new lamejs.Mp3Encoder(1, rec.sampleRate, 128);
-    const parts = [];
-    for (let i = 0; i < samples.length; i += 1152) {
-      const buf = encoder.encodeBuffer(samples.subarray(i, i + 1152));
-      if (buf.length) parts.push(buf);
-    }
-    const tail = encoder.flush();
-    if (tail.length) parts.push(tail);
-    return new Blob(parts, { type: 'audio/mpeg' });
+    return encodeWavPcm16(samples, rec.sampleRate);
   },
 
   async cancel() {
@@ -1307,7 +1332,7 @@ function setupRecorder(entry) {
         if (!blob || blob.size === 0) throw new Error('Nothing was recorded');
         const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
         const fd = new FormData();
-        fd.append('file', blob, `${lang}-entry${entry.id}-${stamp}.mp3`);
+        fd.append('file', blob, `${lang}-entry${entry.id}-${stamp}.wav`);
         fd.append('language', lang);
         fd.append('speaker', state.me.user.name);
         fd.append('recording_notes', 'recorded in browser');
@@ -1592,7 +1617,7 @@ function setupSessionRecorder(entry) {
   async function save() {
     const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
     const fd = new FormData();
-    fd.append('file', blob, `dene-entry${entry.id}-${stamp}.mp3`);
+    fd.append('file', blob, `dene-entry${entry.id}-${stamp}.wav`);
     fd.append('language', 'dene');
     fd.append('speaker', state.me.user.name);
     fd.append('recording_notes', 'recorded in browser');
