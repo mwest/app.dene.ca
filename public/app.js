@@ -1480,7 +1480,16 @@ async function renderMyEarnings() {
 // Recording session — cycle through entries that have no audio yet
 // ---------------------------------------------------------------------------
 
-const recSession = { queue: [], pos: 0, total: 0 };
+const recSession = { queue: [], pos: 0, total: 0, claimed: [] };
+
+// Fire-and-forget release of any work items still claimed in a session (on Skip,
+// Exit, or navigating away) so a partly-finished batch doesn't stay locked for
+// the whole lease window.
+function releaseClaims(session) {
+  const ids = session.claimed;
+  session.claimed = [];
+  for (const wi of ids) api(`/work/${wi}/release`, { method: 'POST' }).catch(() => {});
+}
 
 async function renderRecordSession() {
   setActiveNav('dashboard');
@@ -1488,11 +1497,13 @@ async function renderRecordSession() {
   if (!p) { location.hash = '#/dashboard'; return; }
   view.innerHTML = `<div class="empty">Loading…</div>`;
   let data;
-  try { data = await api(`/entries?project_id=${p.id}&needs_my_audio=dene&complete=yes&limit=200`); }
-  catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
-  recSession.queue = data.entries;
+  try {
+    data = await api(`/projects/${p.id}/work/claim`, { method: 'POST', body: { type: 'recording', language: 'dene', limit: 20 } });
+  } catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+  recSession.queue = data.items.map((i) => ({ ...i.entry, _wi: i.work_item_id }));
   recSession.pos = 0;
-  recSession.total = data.total;
+  recSession.total = recSession.queue.length;
+  recSession.claimed = recSession.queue.map((e) => e._wi);
   renderRecordCard();
 }
 
@@ -1621,7 +1632,8 @@ function setupSessionRecorder(entry) {
     fd.append('language', 'dene');
     fd.append('speaker', state.me.user.name);
     fd.append('recording_notes', 'recorded in browser');
-    await api(`/entries/${entry.id}/audio`, { method: 'POST', body: fd });
+    await api(`/work/${entry._wi}/submit`, { method: 'POST', body: fd });
+    recSession.claimed = recSession.claimed.filter((wi) => wi !== entry._wi);
     URL.revokeObjectURL(blobUrl);
   }
 
@@ -1644,6 +1656,8 @@ function setupSessionRecorder(entry) {
     clearInterval(timer);
     if (Recorder.session) await Recorder.cancel();
     if (blobUrl) URL.revokeObjectURL(blobUrl);
+    api(`/work/${entry._wi}/release`, { method: 'POST' }).catch(() => {});
+    recSession.claimed = recSession.claimed.filter((wi) => wi !== entry._wi);
     recSession.pos++;
     renderRecordCard();
   });
@@ -1655,7 +1669,7 @@ function setupSessionRecorder(entry) {
 // Translation session — cycle through incomplete phrases and fill them in
 // ---------------------------------------------------------------------------
 
-const transSession = { queue: [], pos: 0, total: 0 };
+const transSession = { queue: [], pos: 0, total: 0, claimed: [] };
 
 async function renderTranslateSession() {
   setActiveNav('dashboard');
@@ -1663,11 +1677,13 @@ async function renderTranslateSession() {
   if (!p) { location.hash = '#/dashboard'; return; }
   view.innerHTML = `<div class="empty">Loading…</div>`;
   let data;
-  try { data = await api(`/entries?project_id=${p.id}&kind=phrase&complete=no&limit=200`); }
-  catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
-  transSession.queue = data.entries;
+  try {
+    data = await api(`/projects/${p.id}/work/claim`, { method: 'POST', body: { type: 'translation', limit: 20 } });
+  } catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+  transSession.queue = data.items.map((i) => ({ ...i.entry, _wi: i.work_item_id }));
   transSession.pos = 0;
-  transSession.total = data.total;
+  transSession.total = transSession.queue.length;
+  transSession.claimed = transSession.queue.map((e) => e._wi);
   renderTranslateCard();
 }
 
@@ -1737,10 +1753,11 @@ function setupTranslateCard(entry) {
     const dene = form.dene_text.value.trim();
     const english = form.english_text.value.trim();
     if (!dene && !english) throw new Error('Enter a Dene phrase or an English meaning');
-    await api(`/entries/${entry.id}/translate`, {
+    await api(`/work/${entry._wi}/submit`, {
       method: 'POST',
       body: { dene_text: dene, english_text: english },
     });
+    transSession.claimed = transSession.claimed.filter((wi) => wi !== entry._wi);
   }
 
   async function saveThen(after) {
@@ -1758,7 +1775,12 @@ function setupTranslateCard(entry) {
 
   saveExit.addEventListener('click', () => saveThen(() => { location.hash = '#/dashboard'; }));
   saveNext.addEventListener('click', () => saveThen(() => { transSession.pos++; renderTranslateCard(); }));
-  skipBtn.addEventListener('click', () => { transSession.pos++; renderTranslateCard(); });
+  skipBtn.addEventListener('click', () => {
+    api(`/work/${entry._wi}/release`, { method: 'POST' }).catch(() => {});
+    transSession.claimed = transSession.claimed.filter((wi) => wi !== entry._wi);
+    transSession.pos++;
+    renderTranslateCard();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2238,6 +2260,8 @@ async function loadMe() {
 function route() {
   view.onclick = null; // clear any per-view delegated handler
   if (Recorder.session) Recorder.cancel(); // navigating away releases the mic
+  releaseClaims(recSession); // return any unfinished claimed work to the queue
+  releaseClaims(transSession);
   const hash = location.hash || '#/entries';
   let m;
   // Views that work without a session:

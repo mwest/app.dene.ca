@@ -145,6 +145,10 @@ CREATE TABLE IF NOT EXISTS work_log (
   audio_id    INTEGER REFERENCES audio_files(id) ON DELETE SET NULL,
   amount_cents INTEGER NOT NULL,
   note        TEXT,
+  -- Soft reference to the accepted work_item this ledger row bills for (NULL for
+  -- legacy rows and manual adjustments). Intentionally NOT a foreign key: ledger
+  -- rows must outlive the work_item/entry they came from (money already earned).
+  work_item_id INTEGER,
   created_by  INTEGER NOT NULL REFERENCES users(id),
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -172,6 +176,42 @@ CREATE TABLE IF NOT EXISTS rate_changes (
   changed_by INTEGER NOT NULL REFERENCES users(id),
   changed_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Work items: the canonical unit of claimable, paid translator/speaker work.
+-- A translation item covers completing one incomplete phrase; a recording item
+-- covers one speaker recording one entry in one language (so many speakers can
+-- each hold their own item for the same entry). Under the current auto-accept
+-- policy a claim goes claimed -> accepted on submit in one transaction; the
+-- 'queued'/'submitted'/'rejected' states exist for the future admin-review phase.
+CREATE TABLE IF NOT EXISTS work_items (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id       INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  entry_id         INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+  type             TEXT NOT NULL CHECK (type IN ('translation', 'recording')),
+  language         TEXT,  -- recording: 'dene'|'english'; translation: NULL
+  assigned_to      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  status           TEXT NOT NULL CHECK (status IN
+                     ('queued', 'claimed', 'submitted', 'accepted', 'rejected', 'cancelled')),
+  rate_cents       INTEGER,  -- estimate captured at claim; NOT authoritative (billing uses the accept-time rate)
+  claimed_at       TEXT,
+  lease_expires_at TEXT,
+  submitted_at     TEXT,
+  reviewed_at      TEXT,
+  reviewed_by      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_work_items_entry ON work_items(entry_id);
+CREATE INDEX IF NOT EXISTS idx_work_items_assignee ON work_items(assigned_to);
+-- At most one active translation job per entry (a phrase is translated once).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wi_translation_active
+  ON work_items(entry_id)
+  WHERE type = 'translation' AND status IN ('claimed', 'submitted');
+-- At most one active recording job per (entry, language, speaker) — many speakers
+-- may each record the same entry, but not hold two live claims on the same slot.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wi_recording_active
+  ON work_items(entry_id, language, assigned_to)
+  WHERE type = 'recording' AND status IN ('claimed', 'submitted');
 `);
 
 // Migration: language tag on recordings ('dene' or 'english').
@@ -230,6 +270,17 @@ if (!memTableSql.includes('translator')) {
 // Each user gets at most one recording per language per entry.
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_one_per_lang
          ON audio_files(entry_id, uploaded_by, language)`);
+
+// Migration: ledger idempotency. Link each billed row to its work_item and make
+// that link unique, so re-submitting a work item can never double-bill. Legacy
+// rows keep work_item_id NULL. Fresh DBs already have the column from the
+// CREATE TABLE above; existing DBs get it added here.
+const workLogCols = db.prepare(`PRAGMA table_info(work_log)`).all().map((c) => c.name);
+if (!workLogCols.includes('work_item_id')) {
+  db.exec(`ALTER TABLE work_log ADD COLUMN work_item_id INTEGER`);
+}
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_work_log_item
+         ON work_log(work_item_id) WHERE work_item_id IS NOT NULL`);
 
 export default db;
 
