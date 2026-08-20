@@ -277,6 +277,35 @@ r = await translator.req('POST', `/api/entries/${entryId}/audio`, fd, true);
 check('translator records audio on an entry', r.status === 201, JSON.stringify(r.data));
 const translatorAudioId = r.data?.id;
 
+// --- per-speaker recording queue (#1): needs_my_audio is scoped to the caller ---
+r = await member.req('POST', '/api/entries', { project_id: projectId, dene_text: 'kǫ́', english_text: 'fire' });
+const queueEntryId = r.data?.id;
+const queue = async (c, lang = 'dene') =>
+  (await c.req('GET', `/api/entries?project_id=${projectId}&needs_my_audio=${lang}&complete=yes&limit=200`)).data;
+
+let qa = await queue(member), qb = await queue(member2);
+check('speaker A sees an unrecorded entry in their queue', qa.entries.some((e) => e.id === queueEntryId));
+check('speaker B sees the same entry in their queue', qb.entries.some((e) => e.id === queueEntryId));
+
+fd = new FormData();
+fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'a-dene.wav');
+fd.append('language', 'dene');
+await member.req('POST', `/api/entries/${queueEntryId}/audio`, fd, true);
+
+qa = await queue(member); qb = await queue(member2);
+check("after A records, entry leaves A's queue", !qa.entries.some((e) => e.id === queueEntryId));
+check("after A records, entry still in B's queue (per-speaker, not global)", qb.entries.some((e) => e.id === queueEntryId));
+check('Dene and English queues are independent for a speaker',
+  (await queue(member, 'english')).entries.some((e) => e.id === queueEntryId));
+
+fd = new FormData();
+fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'b-dene.wav');
+fd.append('language', 'dene');
+await member2.req('POST', `/api/entries/${queueEntryId}/audio`, fd, true);
+check("after B records, entry leaves B's queue too", !(await queue(member2)).entries.some((e) => e.id === queueEntryId));
+
+await member.req('DELETE', `/api/entries/${queueEntryId}`); // cascades audio; keeps stats below simple
+
 // clean up the extra clips so the stats checks below stay simple
 await member.req('DELETE', `/api/audio/${englishAudioId}`);
 await member2.req('DELETE', `/api/audio/${member2AudioId}`);

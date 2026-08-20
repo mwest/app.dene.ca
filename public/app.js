@@ -1366,7 +1366,7 @@ async function renderTranslatorDashboard() {
   let comp = null;
   try {
     const [rec, trans, c] = await Promise.all([
-      api(`/entries?project_id=${p.id}&has_audio=no&complete=yes&limit=1`),
+      api(`/entries?project_id=${p.id}&needs_my_audio=dene&complete=yes&limit=1`),
       api(`/entries?project_id=${p.id}&kind=phrase&complete=no&limit=1`),
       api('/me/compensation'),
     ]);
@@ -1463,7 +1463,7 @@ async function renderRecordSession() {
   if (!p) { location.hash = '#/dashboard'; return; }
   view.innerHTML = `<div class="empty">Loading…</div>`;
   let data;
-  try { data = await api(`/entries?project_id=${p.id}&has_audio=no&complete=yes&limit=200`); }
+  try { data = await api(`/entries?project_id=${p.id}&needs_my_audio=dene&complete=yes&limit=200`); }
   catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
   recSession.queue = data.entries;
   recSession.pos = 0;
