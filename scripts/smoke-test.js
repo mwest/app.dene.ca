@@ -277,12 +277,13 @@ check('admin sees all recordings', r.status === 200 && r.data.audio.length === 3
 r = await sa.req('GET', `/api/audio/${member2AudioId}/stream`);
 check("admin can stream members' recordings", r.status === 200);
 
-// #8b: stream falls back to the WAV master when there is no derivative (no ffmpeg
-// in dev); master-download is uploader/admin only; delete-of-current promotes.
+// #8b: the stream serves the MP3 derivative when ffmpeg has produced one (CI)
+// or falls back to the WAV master (dev without ffmpeg) — either way it must be
+// a whitelisted audio type with nosniff, never a client-supplied MIME.
 r = await member.req('GET', `/api/audio/${audioIdV2}/stream`);
-check('stream serves the master (audio/wav) with nosniff when no derivative',
-  r.status === 200 && (r.headers.get('content-type') || '').includes('audio/wav') &&
-  r.headers.get('x-content-type-options') === 'nosniff');
+check('stream serves whitelisted audio (master or derivative) with nosniff',
+  r.status === 200 && /audio\/(wav|mpeg)/.test(r.headers.get('content-type') || '') &&
+  r.headers.get('x-content-type-options') === 'nosniff', r.headers.get('content-type'));
 r = await member2.req('GET', `/api/audio/${audioIdV2}/master`);
 check('non-uploader project member cannot download the master', r.status === 403);
 r = await sa.req('GET', `/api/audio/${audioIdV2}/master`);
