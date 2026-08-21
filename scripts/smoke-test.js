@@ -313,12 +313,13 @@ r = await translator.req('GET', `/api/entries?project_id=${projectId}&has_audio=
 check('translator lists entries without audio (recording queue)', r.status === 200 &&
   r.data.entries.every((e) => e.audio_count === 0), JSON.stringify(r.data.total));
 
+// Hardening #5: paid work flows only through work items — the generic upload and
+// translate endpoints reject translators outright.
 fd = new FormData();
 fd.append('file', new Blob([makeWav(2)], { type: 'audio/wav' }), 'translator-dene.wav');
 fd.append('language', 'dene');
 r = await translator.req('POST', `/api/entries/${entryId}/audio`, fd, true);
-check('translator records audio on an entry', r.status === 201, JSON.stringify(r.data));
-const translatorAudioId = r.data?.id;
+check('translator cannot use the generic audio upload', r.status === 403, JSON.stringify(r.data));
 
 // --- per-speaker recording queue (#1): needs_my_audio is scoped to the caller ---
 r = await member.req('POST', '/api/entries', { project_id: projectId, dene_text: 'kǫ́', english_text: 'fire' });
@@ -352,7 +353,6 @@ await member.req('DELETE', `/api/entries/${queueEntryId}`); // cascades audio; k
 // clean up the extra clips so the stats checks below stay simple
 await member.req('DELETE', `/api/audio/${englishAudioId}`);
 await member2.req('DELETE', `/api/audio/${member2AudioId}`);
-await translator.req('DELETE', `/api/audio/${translatorAudioId}`);
 
 // --- work items: claiming, leases, transactional billing (#3/#4) ---
 // Dedicated project so the candidate sets are controlled and stats above are untouched.
@@ -436,11 +436,84 @@ r = await sa.req('GET', `/api/compensation/${aId}`);
 check('A billed exactly one recording at the snapshot rate',
   r.data.work.filter((w) => w.type === 'recording').length === 1 &&
   r.data.work.find((w) => w.type === 'recording').amount_cents === 300);
-fd2 = new FormData(); fd2.append('file', new Blob([makeWav(2)], { type: 'audio/wav' }), 'a-rec-v2.wav'); fd2.append('language', 'dene');
-r = await A.req('POST', `/api/entries/${recEntry}/audio`, fd2, true);
-check('legacy re-record replaces the file', r.status === 200 && r.data.replaced === true);
+// Hardening #2: an accepted (billed) slot is a satisfied obligation — a fresh
+// claim must NOT re-offer it, and needs_my_audio agrees.
+r = await A.req('POST', `/api/projects/${wiProj}/work/claim`, { type: 'recording', language: 'dene', limit: 20 });
+check('billed slot not re-offered on a fresh claim', !r.data.items.some((i) => i.entry.id === recEntry), JSON.stringify(r.data.items.map((i) => i.entry.id)));
+for (const i of r.data.items) await A.req('POST', `/api/work/${i.work_item_id}/release`); // tidy up stray claims
+
+// Hardening #2 delete policy: billed recordings are org-admin-only to delete.
+r = await sa.req('GET', `/api/entries/${recEntry}`);
+const aBilledAudio = r.data.audio.find((x) => x.uploaded_by_name === 'WI A');
+r = await A.req('DELETE', `/api/audio/${aBilledAudio.id}`);
+check('uploader cannot delete their billed recording', r.status === 403, JSON.stringify(r.data));
+r = await sa.req('DELETE', `/api/audio/${aBilledAudio.id}`);
+check('org admin can delete a billed recording', r.status === 200);
+r = await A.req('POST', `/api/projects/${wiProj}/work/claim`, { type: 'recording', language: 'dene', limit: 20 });
+check('slot still not claimable after admin deletion (obligation satisfied)',
+  !r.data.items.some((i) => i.entry.id === recEntry), JSON.stringify(r.data.items.map((i) => i.entry.id)));
+for (const i of r.data.items) await A.req('POST', `/api/work/${i.work_item_id}/release`);
+r = await A.req('GET', `/api/entries?project_id=${wiProj}&needs_my_audio=dene&complete=yes&limit=200`);
+check('needs_my_audio agrees the billed slot is done', !r.data.entries.some((e) => e.id === recEntry));
+
+// Hardening #2 paid rework: only an explicit admin authorization reopens payment.
+r = await A.req('POST', `/api/entries/${recEntry}/audio-rework`, { user_id: aId, language: 'dene' });
+check('non-admin cannot authorize rework', r.status === 403);
+r = await sa.req('POST', `/api/entries/${recEntry}/audio-rework`, { user_id: aId, language: 'dene' });
+check('org admin authorizes paid rework', r.status === 201 && !!r.data.work_item_id, JSON.stringify(r.data));
+const reworkWi = r.data.work_item_id;
+r = await sa.req('POST', `/api/entries/${recEntry}/audio-rework`, { user_id: aId, language: 'dene' });
+check('duplicate rework authorization rejected', r.status === 409, JSON.stringify(r.data));
+r = await A.req('POST', `/api/projects/${wiProj}/work/claim`, { type: 'recording', language: 'dene', limit: 20 });
+let adopted = r.data.items.find((i) => i.work_item_id === reworkWi);
+check('claim adopts the authorized rework item', !!adopted, JSON.stringify(r.data.items));
+// releasing rework re-queues it (authorization survives a skipped session)
+await A.req('POST', `/api/work/${reworkWi}/release`);
+r = await A.req('POST', `/api/projects/${wiProj}/work/claim`, { type: 'recording', language: 'dene', limit: 20, _test_lease_seconds: -1 });
+check('released rework is re-adoptable', r.data.items.some((i) => i.work_item_id === reworkWi));
+// expired lease also re-queues rework (claimed with an already-past lease above)
+r = await A.req('POST', `/api/projects/${wiProj}/work/claim`, { type: 'recording', language: 'dene', limit: 20 });
+check('expired rework lease re-queues (not cancelled)', r.data.items.some((i) => i.work_item_id === reworkWi), JSON.stringify(r.data.items));
+fd2 = new FormData(); fd2.append('file', new Blob([makeWav(2)], { type: 'audio/wav' }), 'a-rework.wav');
+r = await A.req('POST', `/api/work/${reworkWi}/submit`, fd2, true);
+check('rework submit accepted', r.status === 200, JSON.stringify(r.data));
 r = await sa.req('GET', `/api/compensation/${aId}`);
-check('re-record did not add a second recording bill', r.data.work.filter((w) => w.type === 'recording').length === 1);
+check('rework billed a second recording ledger row',
+  r.data.work.filter((w) => w.type === 'recording').length === 2, JSON.stringify(r.data.work.map((w) => w.type)));
+r = await A.req('POST', `/api/projects/${wiProj}/work/claim`, { type: 'recording', language: 'dene', limit: 20 });
+check('slot excluded again after rework accepted', !r.data.items.some((i) => i.entry.id === recEntry));
+for (const i of r.data.items) await A.req('POST', `/api/work/${i.work_item_id}/release`);
+
+// Hardening #3/#1 invariant: an accepted work item ALWAYS has its ledger row —
+// even when the audio already exists (recorded via the entry page mid-session).
+r = await sa.req('POST', '/api/entries', { project_id: wiProj, dene_text: 'ts’u', english_text: 'spruce' });
+const midEntry = r.data.id;
+r = await sa.req('POST', `/api/projects/${wiProj}/work/claim`, { type: 'recording', language: 'dene', limit: 20 });
+const midItem = r.data.items.find((i) => i.entry.id === midEntry);
+for (const i of r.data.items.filter((x) => x.entry.id !== midEntry)) await sa.req('POST', `/api/work/${i.work_item_id}/release`);
+check('org admin can claim recording work', !!midItem);
+fd2 = new FormData(); fd2.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'mid.wav'); fd2.append('language', 'dene');
+r = await sa.req('POST', `/api/entries/${midEntry}/audio`, fd2, true);   // entry-page upload mid-session (unbilled)
+const midAudioId = r.data.id;
+fd2 = new FormData(); fd2.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'mid-dup.wav');
+r = await sa.req('POST', `/api/work/${midItem.work_item_id}/submit`, fd2, true);
+check('submit with existing audio accepts against it', r.status === 200 && r.data.audio?.id === midAudioId, JSON.stringify(r.data));
+r = await sa.req('GET', `/api/compensation/${(await sa.req('GET', '/api/me')).data.user.id}`);
+check('accepted-against-existing still writes exactly one ledger row',
+  r.data.work.filter((w) => w.type === 'recording' && w.entry_id === midEntry).length === 1, JSON.stringify(r.data.work));
+
+// Documented policy: re-blanking a billed phrase's side (an authorized edit by a
+// different actor) makes it genuinely new translation work — claimable + payable.
+await sa.req('PATCH', `/api/entries/${expPhrase}`, { english_text: '' });
+r = await B.req('POST', `/api/projects/${wiProj}/work/claim`, { type: 'translation', limit: 20 });
+const reblank = r.data.items.find((i) => i.entry.id === expPhrase);
+check('re-blanked billed phrase is claimable again', !!reblank, JSON.stringify(r.data.items));
+r = await B.req('POST', `/api/work/${reblank.work_item_id}/submit`, { english_text: 'fire (redone)' });
+check('re-blank retranslation accepted', r.status === 200);
+r = await sa.req('GET', `/api/compensation/${bId}`);
+check('re-blank yields a second translation ledger row (documented policy)',
+  r.data.work.filter((w) => w.type === 'translation' && w.entry_id === expPhrase).length === 2,
+  JSON.stringify(r.data.work.map((w) => w.type)));
 
 await sa.req('DELETE', `/api/projects/${wiProj}`, { confirm_name: pname + ' WI' });
 
@@ -643,18 +716,19 @@ check('cannot blank both sides of a phrase', r.status === 400);
 r = await translator.req('POST', '/api/entries', { project_id: projectId, kind: 'phrase', english_text: 'nope' });
 check('translator cannot create phrases', r.status === 403);
 
-// translation session endpoint: a translator may complete an incomplete phrase
-r = await translator.req('POST', `/api/entries/${phraseDeneOnly}/translate`, { dene_text: '', english_text: '' });
+// Hardening #5: /translate is a member/admin direct-edit tool now (unbilled) —
+// translators are rejected and must use the work-item translation session.
+r = await translator.req('POST', `/api/entries/${phraseDeneOnly}/translate`, { dene_text: 'sǫǫ', english_text: 'nope' });
+check('translator cannot use the generic translate endpoint', r.status === 403, JSON.stringify(r.data));
+
+r = await member.req('POST', `/api/entries/${phraseDeneOnly}/translate`, { dene_text: '', english_text: '' });
 check('translate rejects blanking both sides', r.status === 400);
 
-r = await translator.req('POST', `/api/entries/${phraseDeneOnly}/translate`, { dene_text: 'sǫǫ', english_text: 'water (clean)' });
-check('translator completes a phrase via translate', r.status === 200 &&
+r = await member.req('POST', `/api/entries/${phraseDeneOnly}/translate`, { dene_text: 'sǫǫ', english_text: 'water (clean)' });
+check('member completes a phrase via translate (unbilled)', r.status === 200 &&
   r.data.dene_text === 'sǫǫ' && r.data.english_text === 'water (clean)', JSON.stringify(r.data));
 
-r = await translator.req('POST', `/api/entries/${phraseDeneOnly}/translate`, { english_text: 'changed again' });
-check('translator cannot re-translate a completed phrase', r.status === 403);
-
-r = await translator.req('POST', `/api/entries/${entryId}/translate`, { english_text: 'x' });
+r = await member.req('POST', `/api/entries/${entryId}/translate`, { english_text: 'x' });
 check('translate rejected on a dictionary word', r.status === 400);
 
 // clean up the phrases (and their cascade-deleted audio) to keep counts stable
@@ -678,20 +752,24 @@ const compWord = r.data.id;
 r = await sa.req('POST', '/api/entries', { project_id: compProj, kind: 'phrase', english_text: 'good morning' });
 const compPhrase = r.data.id;
 
+// Paid work happens through work items only (hardening #5).
+const compClaim = async (type) =>
+  (await translator.req('POST', `/api/projects/${compProj}/work/claim`, { type, ...(type === 'recording' ? { language: 'dene' } : {}), limit: 20 })).data;
+let cw = (await compClaim('recording')).items.find((i) => i.entry.id === compWord);
+check('translator claims recording work in comp project', !!cw, 'no item for compWord');
 fd = new FormData();
 fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'comp.wav');
-fd.append('language', 'dene');
-r = await translator.req('POST', `/api/entries/${compWord}/audio`, fd, true);
-check('translator records in comp project', r.status === 201);
+r = await translator.req('POST', `/api/work/${cw.work_item_id}/submit`, fd, true);
+check('translator records via work item', r.status === 200, JSON.stringify(r.data));
 
-fd = new FormData();
-fd.append('file', new Blob([makeWav(2)], { type: 'audio/wav' }), 'comp2.wav');
-fd.append('language', 'dene');
-r = await translator.req('POST', `/api/entries/${compWord}/audio`, fd, true);
-check('re-record replaces without double-billing', r.status === 200 && r.data.replaced === true);
+// The billed slot is a satisfied obligation: no second recording claim for it.
+cw = (await compClaim('recording')).items.find((i) => i.entry.id === compWord);
+check('re-claim of the billed slot is not offered (no double-billing)', !cw);
 
-r = await translator.req('POST', `/api/entries/${compPhrase}/translate`, { dene_text: 'edǝ', english_text: 'good morning' });
-check('translator translates in comp project', r.status === 200);
+let ct = (await compClaim('translation')).items.find((i) => i.entry.id === compPhrase);
+check('translator claims translation work in comp project', !!ct, 'no item for compPhrase');
+r = await translator.req('POST', `/api/work/${ct.work_item_id}/submit`, { dene_text: 'edǝ', english_text: 'good morning' });
+check('translator translates via work item', r.status === 200, JSON.stringify(r.data));
 
 r = await sa.req('GET', `/api/compensation/${translatorId}`);
 check('ledger uses snapshotted rates (175 recording + 200 translation)', r.status === 200 &&
@@ -705,11 +783,13 @@ r = await sa.req('POST', `/api/compensation/${translatorId}/payments`, { amount_
 check('recording a payment lowers the balance', r.status === 201 &&
   r.data.paid_cents === 300 && r.data.balance_cents === earnedBefore - 300, JSON.stringify(r.data));
 
-r = await sa.req('POST', `/api/compensation/${translatorId}/adjustments`, { amount_cents: 25, note: 'rounding bonus' });
+r = await sa.req('POST', `/api/compensation/${translatorId}/adjustments`, { amount_cents: 25, note: 'rounding bonus', project_id: compProj });
 check('a positive adjustment raises the balance', r.status === 201 &&
   r.data.balance_cents === earnedBefore - 300 + 25, JSON.stringify(r.data));
-r = await sa.req('POST', `/api/compensation/${translatorId}/adjustments`, { amount_cents: 25 });
+r = await sa.req('POST', `/api/compensation/${translatorId}/adjustments`, { amount_cents: 25, project_id: compProj });
 check('adjustment requires a note', r.status === 400);
+r = await sa.req('POST', `/api/compensation/${translatorId}/adjustments`, { amount_cents: 25, note: 'no project' });
+check('adjustment requires a project (org attribution)', r.status === 400);
 
 r = await translator.req('GET', '/api/me/compensation');
 check('translator sees their own totals', r.status === 200 &&
@@ -731,8 +811,12 @@ const tr2Id = r.data.user_id;
 const tr2 = client();
 await tr2.req('POST', '/api/login', { email: tr2Email, password: 'rateless-pass-1' });
 r = await sa.req('POST', '/api/entries', { project_id: compProj, kind: 'phrase', english_text: 'goodbye' });
-r = await tr2.req('POST', `/api/entries/${r.data.id}/translate`, { dene_text: 'mahsi', english_text: 'goodbye' });
-check('unrated translator can still work', r.status === 200);
+const goodbyeId = r.data.id;
+r = await tr2.req('POST', `/api/projects/${compProj}/work/claim`, { type: 'translation', limit: 20 });
+const tr2Item = r.data.items.find((i) => i.entry.id === goodbyeId);
+check('unrated translator can still claim work', !!tr2Item, JSON.stringify(r.data.items));
+r = await tr2.req('POST', `/api/work/${tr2Item.work_item_id}/submit`, { dene_text: 'mahsi', english_text: 'goodbye' });
+check('unrated translator can still work', r.status === 200, JSON.stringify(r.data));
 r = await sa.req('GET', `/api/compensation/${tr2Id}`);
 check('unrated work is logged at amount 0', r.status === 200 &&
   r.data.earned_cents === 0 && r.data.work.length === 1, JSON.stringify(r.data));
@@ -964,6 +1048,61 @@ check('ordinary member cannot read org membership', r.status === 403);
 // Multi-org ambiguity: sa now administers two orgs.
 r = await sa.req('POST', '/api/projects', { name: `Ambiguous ${Date.now()}` });
 check('multi-org admin must specify organization_id', r.status === 400);
+
+// --- multi-org COMPENSATION isolation (hardening #1) ---
+// The main-org translator earns in Org2 too; each org's admin must see only
+// their own slice. sa administers both orgs, so a dedicated org1-only admin is
+// the isolated viewer for Org1.
+const o1aEmail = `org1admin-${Date.now()}@test.ca`;
+r = await sa.req('POST', '/api/users', { email: o1aEmail, name: 'Org1 Admin', password: 'org1admin-pass-1' });
+const o1aId = r.data.user_id;
+const mainOrg = (await sa.req('GET', '/api/me')).data.orgs.find((o) => o.id !== orgId);
+await sa.req('POST', `/api/orgs/${mainOrg.id}/members`, { email: o1aEmail, role: 'admin' });
+const o1a = client();
+await o1a.req('POST', '/api/login', { email: o1aEmail, password: 'org1admin-pass-1' });
+
+// translator (main-org history from the comp block) now works in Org2.
+await oa.req('POST', `/api/projects/${orgProjId}/members`, { email: translatorEmail, role: 'translator' });
+r = await oa.req('PUT', `/api/compensation/${translatorId}/rates`, { project_id: orgProjId, type: 'translation', rate_cents: 700 });
+check('org2 admin sets an org2 rate', r.status === 200, JSON.stringify(r.data));
+r = await oa.req('POST', '/api/entries', { project_id: orgProjId, kind: 'phrase', english_text: 'org2 phrase' });
+const org2Phrase = r.data.id;
+r = await translator.req('POST', `/api/projects/${orgProjId}/work/claim`, { type: 'translation', limit: 20 });
+const org2Item = r.data.items.find((i) => i.entry.id === org2Phrase);
+r = await translator.req('POST', `/api/work/${org2Item.work_item_id}/submit`, { dene_text: 'x2', english_text: 'org2 phrase' });
+check('translator completes org2 work', r.status === 200);
+r = await oa.req('POST', `/api/compensation/${translatorId}/payments`, { amount_cents: 100 });
+check('org2 admin records an org2 payment', r.status === 201, JSON.stringify(r.data));
+
+r = await oa.req('GET', `/api/compensation/${translatorId}`);
+check('org2 admin sees ONLY org2 work', r.status === 200 &&
+  r.data.work.length === 1 && r.data.work[0].amount_cents === 700, JSON.stringify(r.data.work));
+check('org2 admin sees ONLY org2 totals/payments/rates/projects',
+  r.data.earned_cents === 700 && r.data.paid_cents === 100 &&
+  r.data.payments.length === 1 && r.data.rates.length === 1 &&
+  r.data.projects.every((p) => p.id === orgProjId), JSON.stringify({ e: r.data.earned_cents, p: r.data.paid_cents }));
+
+r = await o1a.req('GET', `/api/compensation/${translatorId}`);
+check('org1 admin sees NO org2 rows', r.status === 200 &&
+  r.data.work.every((w) => w.amount_cents !== 700) && r.data.payments.every((p) => p.amount_cents !== 100),
+  JSON.stringify({ work: r.data.work.length, pay: r.data.payments.length }));
+check('org1 admin totals exclude org2', r.data.earned_cents !== 700 && r.data.paid_cents === 300,
+  JSON.stringify({ e: r.data.earned_cents, p: r.data.paid_cents }));
+
+r = await translator.req('GET', '/api/me/compensation');
+check('contributor /me stays GLOBAL across orgs',
+  r.data.work.some((w) => w.amount_cents === 700) && r.data.paid_cents === 400,
+  JSON.stringify({ e: r.data.earned_cents, p: r.data.paid_cents }));
+
+r = await oa.req('GET', `/api/compensation/${tr2Id}`);
+check('org2 admin gets 403 on an org1-only contributor', r.status === 403, JSON.stringify(r.data));
+r = await oa.req('GET', '/api/compensation');
+check('org2 compensation list excludes org1-only people', r.status === 200 &&
+  !r.data.translators.some((t) => t.id === tr2Id) && r.data.translators.some((t) => t.id === translatorId),
+  JSON.stringify(r.data.translators.map((t) => t.id)));
+
+// isolation cleanup: drop the org1 admin grant (org2 teardown happens below)
+await sa.req('DELETE', `/api/orgs/${mainOrg.id}/members/${o1aId}`);
 
 // Revoking the org grant ends corpus authority immediately.
 await sa.req('DELETE', `/api/orgs/${orgId}/members/${oaId}`);
