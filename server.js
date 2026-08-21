@@ -5,6 +5,7 @@ import path from 'node:path';
 import db from './src/db.js';
 import api from './src/api.js';
 import { backfillEmbeddings } from './scripts/embed-backfill.js';
+import { backfillAudio } from './scripts/audio-backfill.js';
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(import.meta.dirname, 'public');
@@ -48,4 +49,8 @@ app.listen(PORT, () => {
   // data without a separate/SSH step; idempotent, so it no-ops once caught up.
   backfillEmbeddings((m) => console.log(`[embed] ${m}`))
     .catch((e) => console.error('[embed] backfill failed:', e.message));
+  // Hash any recordings missing a checksum and generate missing playback
+  // derivatives (idempotent; no-ops once caught up). Best-effort, non-blocking.
+  backfillAudio((m) => console.log(`[audio] ${m}`))
+    .catch((e) => console.error('[audio] backfill failed:', e.message));
 });

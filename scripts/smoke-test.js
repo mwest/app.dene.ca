@@ -170,8 +170,9 @@ const audioId = r.data?.id;
 check('duration auto-captured (~2s)', Math.abs((r.data?.duration_seconds ?? 0) - 2) < 0.1,
   `got ${r.data?.duration_seconds}`);
 check('language tagged', r.data?.language === 'dene', JSON.stringify(r.data));
-check('stored under audio/<userID>/', r.data?.stored_name?.startsWith(`${memberId}/`),
+check('master stored under audio/masters/<userID>/', r.data?.stored_name?.startsWith(`masters/${memberId}/`),
   `stored_name=${r.data?.stored_name}`);
+check('recording marked lossless master', r.data?.archive_class === 'lossless_master', JSON.stringify(r.data?.archive_class));
 
 fd = new FormData();
 fd.append('file', new Blob([Buffer.from('this is not audio at all')], { type: 'audio/wav' }), 'corrupt.wav');
@@ -193,13 +194,20 @@ check('member streams audio', r.status === 200);
 r = await stranger.req('GET', `/api/audio/${audioId}/stream`);
 check('non-member cannot stream audio', r.status === 403);
 
-// one recording per language per user: same-language upload replaces
+// Re-record: a same-language upload creates a NEW version and supersedes the old
+// one (the old master is preserved, not destroyed) — #8b.
 fd = new FormData();
 fd.append('file', new Blob([makeWav(3)], { type: 'audio/wav' }), 'greeting-v2.wav');
 fd.append('language', 'dene');
 r = await member.req('POST', `/api/entries/${entryId}/audio`, fd, true);
-check('same-language re-upload replaces (upsert)', r.status === 200 && r.data.replaced === true &&
-  r.data.id === audioId && Math.abs(r.data.duration_seconds - 3) < 0.1, JSON.stringify(r.data));
+check('re-record creates a new version (supersedes, not replace)', r.status === 200 &&
+  r.data.replaced === true && r.data.id !== audioId && r.data.supersedes_audio_id === audioId &&
+  r.data.is_current === 1 && Math.abs(r.data.duration_seconds - 3) < 0.1, JSON.stringify(r.data));
+const audioIdV2 = r.data.id;
+r = await member.req('GET', `/api/audio/${audioIdV2}/history`);
+check('old version preserved in history', r.status === 200 && r.data.versions.some((v) => v.id === audioId), JSON.stringify(r.data));
+r = await member.req('GET', `/api/audio/${audioId}/master`);
+check('superseded master still downloadable', r.status === 200);
 
 fd = new FormData();
 fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'english.wav');
@@ -243,6 +251,33 @@ check('admin sees all recordings', r.status === 200 && r.data.audio.length === 3
 
 r = await sa.req('GET', `/api/audio/${member2AudioId}/stream`);
 check("admin can stream members' recordings", r.status === 200);
+
+// #8b: stream falls back to the WAV master when there is no derivative (no ffmpeg
+// in dev); master-download is uploader/admin only; delete-of-current promotes.
+r = await member.req('GET', `/api/audio/${audioIdV2}/stream`);
+check('stream serves the master (audio/wav) with nosniff when no derivative',
+  r.status === 200 && (r.headers.get('content-type') || '').includes('audio/wav') &&
+  r.headers.get('x-content-type-options') === 'nosniff');
+r = await member2.req('GET', `/api/audio/${audioIdV2}/master`);
+check('non-uploader project member cannot download the master', r.status === 403);
+r = await sa.req('GET', `/api/audio/${audioIdV2}/master`);
+check('admin can download the master', r.status === 200);
+
+// Promote-on-delete, on a throwaway entry so the counts above are untouched.
+r = await member.req('POST', '/api/entries', { project_id: projectId, dene_text: 'kǫ̀', english_text: 'fire (v)' });
+const verEntry = r.data.id;
+let vfd = new FormData(); vfd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'v1.wav'); vfd.append('language', 'dene');
+const ver1 = (await member.req('POST', `/api/entries/${verEntry}/audio`, vfd, true)).data;
+vfd = new FormData(); vfd.append('file', new Blob([makeWav(2)], { type: 'audio/wav' }), 'v2.wav'); vfd.append('language', 'dene');
+const ver2 = (await member.req('POST', `/api/entries/${verEntry}/audio`, vfd, true)).data;
+await member.req('DELETE', `/api/audio/${ver2.id}`); // delete current → v1 promoted
+r = await member.req('GET', `/api/entries/${verEntry}`);
+check('deleting the current version promotes the previous one',
+  r.data.audio.length === 1 && r.data.audio[0].id === ver1.id && r.data.audio[0].is_current === 1, JSON.stringify(r.data.audio));
+await member.req('DELETE', `/api/audio/${ver1.id}`); // delete last version → slot empty
+r = await member.req('GET', `/api/entries/${verEntry}`);
+check('deleting the last version empties the slot', r.data.audio.length === 0);
+await member.req('DELETE', `/api/entries/${verEntry}`);
 
 // --- translator role: records audio, cannot touch entries ---
 const translatorEmail = `translator${Date.now()}@test.ca`;
@@ -413,9 +448,9 @@ r = await sa.req('GET', `/api/projects/${projectId}/export?format=csv`);
 check('CSV export', r.status === 200 && String(r.data).includes('dene_text'), String(r.data).slice(0, 100));
 
 r = await sa.req('GET', `/api/projects/${projectId}/export?format=json`);
-check('JSON export includes audio refs', r.status === 200 &&
+check('JSON export includes audio refs (current master path)', r.status === 200 &&
   r.data.entries[0].audio.length === 1 &&
-  r.data.entries[0].audio[0].file === `audio/${memberId}/` + r.data.entries[0].audio[0].file.split('/').pop() &&
+  r.data.entries[0].audio[0].file === `audio/masters/${memberId}/` + r.data.entries[0].audio[0].file.split('/').pop() &&
   r.data.entries[0].audio[0].language === 'dene',
   JSON.stringify(r.data).slice(0, 300));
 
@@ -828,8 +863,10 @@ r = await sa.req('DELETE', `/api/projects/${projectId}`, { confirm_name: 'Wrong 
 check('wrong confirmation name rejected', r.status === 400, JSON.stringify(r.data));
 
 r = await sa.req('DELETE', `/api/projects/${projectId}`, { confirm_name: pname });
-check('superadmin deletes project (entries + recordings)', r.status === 200 &&
-  r.data.deleted_entries === 9 && r.data.deleted_recordings === 1, JSON.stringify(r.data));
+// deleted_recordings counts ALL versions (current + superseded), so the member's
+// dene v1 + v2 both count here (#8b keeps superseded masters until project delete).
+check('superadmin deletes project (entries + all recording versions)', r.status === 200 &&
+  r.data.deleted_entries === 9 && r.data.deleted_recordings === 2, JSON.stringify(r.data));
 
 r = await sa.req('GET', `/api/entries/${entryId}`);
 check('entries gone after project deletion', r.status === 404);

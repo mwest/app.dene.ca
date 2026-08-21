@@ -197,6 +197,76 @@ const Recorder = {
   },
 };
 
+// Label of the mic chosen during preflight, attached to recordings as provenance.
+let micDeviceLabel = null;
+
+// Quick microphone check before a recording session: confirms audio is arriving,
+// shows the selected mic, and warns about clipping or a very low signal — enough
+// to avoid a whole session of unusable takes without turning into a mixing desk.
+// Renders into `container`; resolves true to proceed, false to cancel. Holds its
+// OWN mic stream and tears it down before returning, so the real Recorder opens a
+// fresh one (never two streams at once).
+function micPreflight(container) {
+  return new Promise((resolve) => {
+    container.innerHTML = `
+      <div class="card preflight">
+        <h2 style="margin-top:0">🎙️ Microphone check</h2>
+        <p class="preflight-device" id="pf-device">Requesting microphone…</p>
+        <div class="preflight-meter"><div class="preflight-level" id="pf-level"></div></div>
+        <p class="preflight-hint" id="pf-hint">Say a few words at your normal volume.</p>
+        <div class="rec-actions">
+          <button class="secondary" id="pf-cancel">Cancel</button>
+          <button id="pf-start" disabled>Start recording</button>
+        </div>
+      </div>`;
+    let stream = null, ctx = null, raf = 0;
+    const cleanup = () => {
+      cancelAnimationFrame(raf);
+      if (ctx) ctx.close().catch(() => {});
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      stream = null; ctx = null;
+    };
+    const finish = (ok) => { cleanup(); resolve(ok); };
+    $('#pf-cancel', container).addEventListener('click', () => finish(false));
+
+    navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    }).then(async (s) => {
+      stream = s;
+      const track = s.getAudioTracks()[0];
+      micDeviceLabel = track?.label || null;
+      $('#pf-device', container).textContent = micDeviceLabel ? `Using: ${micDeviceLabel}` : 'Microphone ready';
+      $('#pf-start', container).disabled = false;
+      $('#pf-start', container).addEventListener('click', () => finish(true));
+
+      ctx = new AudioContext();
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      ctx.createMediaStreamSource(s).connect(analyser);
+      const buf = new Float32Array(analyser.fftSize);
+      const level = $('#pf-level', container);
+      const hint = $('#pf-hint', container);
+      let clipped = false, sawSignal = false;
+      const tick = () => {
+        analyser.getFloatTimeDomainData(buf);
+        let peak = 0, sum = 0;
+        for (const v of buf) { const a = Math.abs(v); if (a > peak) peak = a; sum += v * v; }
+        const rms = Math.sqrt(sum / buf.length);
+        level.style.width = `${Math.min(100, Math.round(peak * 100))}%`;
+        if (peak >= 0.99) { clipped = true; level.style.background = 'var(--danger, #c0392b)'; }
+        if (rms > 0.02) sawSignal = true;
+        hint.textContent = clipped
+          ? '⚠️ Too loud — move back or lower the input level to avoid clipping.'
+          : sawSignal ? '✓ Sounds good.' : 'Say a few words at your normal volume.';
+        raf = requestAnimationFrame(tick);
+      };
+      tick();
+    }).catch(() => {
+      $('#pf-device', container).textContent = 'Could not access the microphone — check browser permissions.';
+    });
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Modal helper
 // ---------------------------------------------------------------------------
@@ -1109,7 +1179,7 @@ async function renderEntryDetail(id) {
       </div>
       <details style="border-top:1px solid var(--line);padding-top:0.8rem;margin-top:1rem">
         <summary style="cursor:pointer;color:var(--muted)">Upload an audio file instead (WAV / MP3 / M4A)</summary>
-        <p style="color:var(--muted);font-size:0.85rem">Uploading replaces your existing recording for that language.</p>
+        <p style="color:var(--muted);font-size:0.85rem">Uploading adds a new version for that language; the previous master is kept in version history.</p>
         <form id="audio-form" style="margin-top:0.8rem">
           <div class="form-row">
             <label class="field"><span>Audio file</span>
@@ -1236,6 +1306,23 @@ async function renderEntryDetail(id) {
         toast('Recording deleted');
         renderEntryDetail(entry.id);
       } catch (err) { toast(err.message, true); }
+    } else if (action === 'history') {
+      const box = $(`#versions-${audioId}`);
+      if (!box) return;
+      if (!box.hidden) { box.hidden = true; box.innerHTML = ''; return; }
+      box.hidden = false;
+      box.innerHTML = '<div class="empty small">Loading…</div>';
+      try {
+        const { versions } = await api(`/audio/${audioId}/history`);
+        box.innerHTML = versions.length
+          ? `<div class="versions-head">Previous versions (superseded masters, kept for the archive)</div>` +
+            versions.map((v) => `
+              <div class="version-row">
+                <span>${fmtDuration(v.duration_seconds)} · ${(v.size_bytes / 1024 / 1024).toFixed(1)} MB · ${v.archive_class === 'legacy_lossy' ? 'legacy' : 'master'}${v.sample_rate_hz ? ` · ${(v.sample_rate_hz / 1000).toFixed(1)} kHz` : ''} · ${fmtDate(v.created_at)}</span>
+                <a class="btn ghost small" href="/api/audio/${v.id}/master">⬇ Master</a>
+              </div>`).join('')
+          : '<div class="empty small">No previous versions — this is the first recording.</div>';
+      } catch (err) { box.innerHTML = `<div class="empty small">${esc(err.message)}</div>`; }
     } else if (action === 'edit-meta') {
       const item = btn.closest('.audio-item');
       const speaker = prompt('Speaker name / ID:', item.dataset.speaker || '');
@@ -1262,7 +1349,10 @@ function slotHtml(lang, a) {
         <div class="slot-controls">
           <button type="button" class="rec-btn small" data-lang="${lang}">⏺ Re-record</button>
           <button type="button" class="danger small" data-action="delete" data-id="${a.id}">Delete</button>
-        </div>` : `
+          <a class="btn ghost small" href="/api/audio/${a.id}/master" title="Download the lossless archival master">⬇ Master</a>
+          <button type="button" class="ghost small" data-slot-history="${a.id}">Versions</button>
+        </div>
+        <div class="audio-versions" id="slotver-${a.id}" hidden></div>` : `
         <div class="slot-empty">No recording yet</div>
         <div class="slot-controls">
           <button type="button" class="rec-btn" data-lang="${lang}">⏺ Record ${label}</button>
@@ -1279,6 +1369,28 @@ function setupRecorder(entry) {
     const stopBtn = e.target.closest('[data-rec=stop]');
     const cancelBtn = e.target.closest('[data-rec=cancel]');
     const deleteBtn = e.target.closest('button[data-action=delete]');
+    const histBtn = e.target.closest('button[data-slot-history]');
+
+    if (histBtn) {
+      const id = histBtn.dataset.slotHistory;
+      const box2 = $(`#slotver-${id}`);
+      if (!box2) return;
+      if (!box2.hidden) { box2.hidden = true; box2.innerHTML = ''; return; }
+      box2.hidden = false;
+      box2.innerHTML = '<div class="empty small">Loading…</div>';
+      try {
+        const { versions } = await api(`/audio/${id}/history`);
+        box2.innerHTML = versions.length
+          ? `<div class="versions-head">Previous versions (superseded masters, kept for the archive)</div>` +
+            versions.map((v) => `
+              <div class="version-row">
+                <span>${fmtDuration(v.duration_seconds)} · ${(v.size_bytes / 1024 / 1024).toFixed(1)} MB${v.sample_rate_hz ? ` · ${(v.sample_rate_hz / 1000).toFixed(1)} kHz` : ''} · ${fmtDate(v.created_at)}</span>
+                <a class="btn ghost small" href="/api/audio/${v.id}/master">⬇ Master</a>
+              </div>`).join('')
+          : '<div class="empty small">No previous versions — this is the first recording.</div>';
+      } catch (err) { box2.innerHTML = `<div class="empty small">${esc(err.message)}</div>`; }
+      return;
+    }
 
     if (deleteBtn) {
       if (!confirm('Delete this recording?')) return;
@@ -1336,6 +1448,8 @@ function setupRecorder(entry) {
         fd.append('language', lang);
         fd.append('speaker', state.me.user.name);
         fd.append('recording_notes', 'recorded in browser');
+        fd.append('capture_method', 'browser_recording');
+        if (micDeviceLabel) fd.append('capture_device', micDeviceLabel);
         await api(`/entries/${entry.id}/audio`, { method: 'POST', body: fd });
         toast(`${lang === 'english' ? 'English' : 'Dene'} recording saved`);
       } catch (err) {
@@ -1366,9 +1480,12 @@ function audioItemHtml(a, entry) {
       <audio controls preload="none" src="/api/audio/${a.id}/stream"></audio>
       ${canManage ? `
       <div class="audio-actions">
+        <a class="btn ghost small" href="/api/audio/${a.id}/master" title="Download the lossless archival master">⬇ Master</a>
+        <button type="button" class="ghost small" data-action="history" data-id="${a.id}">Previous versions</button>
         <button type="button" class="ghost small" data-action="edit-meta" data-id="${a.id}">Edit details</button>
         <button type="button" class="danger small" data-action="delete" data-id="${a.id}">Delete</button>
-      </div>` : ''}
+      </div>
+      <div class="audio-versions" id="versions-${a.id}" hidden></div>` : ''}
     </div>`;
 }
 
@@ -1495,6 +1612,10 @@ async function renderRecordSession() {
   setActiveNav('dashboard');
   const p = activeProject();
   if (!p) { location.hash = '#/dashboard'; return; }
+  // Quick mic check before we start claiming and cycling entries.
+  const ok = await micPreflight(view);
+  if (location.hash !== '#/record') return; // user navigated away during preflight
+  if (!ok) { location.hash = '#/dashboard'; return; }
   view.innerHTML = `<div class="empty">Loading…</div>`;
   let data;
   try {
@@ -1632,6 +1753,8 @@ function setupSessionRecorder(entry) {
     fd.append('language', 'dene');
     fd.append('speaker', state.me.user.name);
     fd.append('recording_notes', 'recorded in browser');
+    fd.append('capture_method', 'browser_recording');
+    if (micDeviceLabel) fd.append('capture_device', micDeviceLabel);
     await api(`/work/${entry._wi}/submit`, { method: 'POST', body: fd });
     recSession.claimed = recSession.claimed.filter((wi) => wi !== entry._wi);
     URL.revokeObjectURL(blobUrl);
