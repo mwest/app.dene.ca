@@ -210,3 +210,21 @@ fly ssh sftp get /app/data/dene.db ./backup/dene.db
 - Run behind HTTPS (the session cookie is marked `Secure` when `NODE_ENV=production`).
 - The `projects.is_public` column exists for the future public Dene Voice Library face
   (P2-1) but nothing reads it yet.
+
+## Platform administration vs. data ownership
+
+Corpus authority belongs to **organizations**, not the platform operator. A
+superadmin (`is_superadmin`) handles platform concerns — accounts, translation
+service requests, provisioning orgs — and has **no implicit access** to any
+project's entries, recordings, compensation, or exports. All corpus authority
+flows from `organization_memberships` (`owner_admin`/`admin`) or per-project
+`memberships`. A one-time migration attached existing projects to the
+"Dene Voice Project" organization and granted `owner_admin` to the superadmins
+that existed at that moment — explicit and revocable, managed on the
+Organization page.
+
+Bootstrap on a fresh install: `npm run create-superadmin -- <email> <name> <pw>`,
+sign in, `POST /api/orgs` (the creator becomes owner_admin), then create
+projects. If operator support access to a corpus is ever needed, grant a
+temporary org membership (visible on the Organization page) rather than adding
+any invisible bypass; a formal audited "break glass" flow is future work.

@@ -897,5 +897,93 @@ r = await stranger.req('GET', '/api/projects');
 check('membership gone after project deletion', r.status === 200 && r.data.projects.length === 0,
   JSON.stringify(r.data));
 
+// --- organizations & platform/data separation (#5) ---
+// (Placed last: creating a second org makes sa multi-org, so earlier
+// organization_id-less project creations must already have run.)
+r = await sa.req('GET', '/api/me');
+check('superadmin holds an explicit owner_admin org grant',
+  (r.data.orgs ?? []).some((o) => o.role === 'owner_admin'), JSON.stringify(r.data.orgs));
+
+// A brand-new PLATFORM superadmin with no org grant has no corpus access.
+const psEmail = `platform-${Date.now()}@test.ca`;
+r = await sa.req('POST', '/api/users', { email: psEmail, name: 'Platform Only', password: 'platform-pass-1' });
+const psId = r.data.user_id;
+await sa.req('PATCH', `/api/users/${psId}`, { is_superadmin: true });
+const ps = client();
+await ps.req('POST', '/api/login', { email: psEmail, password: 'platform-pass-1' });
+r = await ps.req('GET', '/api/projects');
+check('platform admin without org grant sees no projects', r.status === 200 && r.data.projects.length === 0,
+  JSON.stringify(r.data.projects?.length));
+// find an existing corpus project id from sa's view for the 403 probes
+const anyProj = (await sa.req('GET', '/api/projects')).data.projects[0];
+// With zero visible projects, /entries short-circuits to an empty 200 — either
+// way, no corpus content comes back.
+r = await ps.req('GET', `/api/entries?project_id=${anyProj.id}`);
+check('platform admin gets no entry content', r.status === 403 ||
+  (r.status === 200 && r.data.total === 0 && r.data.entries.length === 0), JSON.stringify(r.data));
+r = await ps.req('GET', `/api/projects/${anyProj.id}/stats`);
+check('platform admin cannot read stats', r.status === 403);
+r = await ps.raw('GET', `/api/projects/${anyProj.id}/export-bundle`);
+check('platform admin cannot export the corpus', r.status === 403);
+r = await ps.req('GET', '/api/compensation');
+check('platform admin cannot read compensation', r.status === 403);
+r = await ps.req('POST', '/api/projects', { name: `No Org ${Date.now()}` });
+check('platform admin cannot create projects without an org', r.status === 403);
+r = await ps.req('GET', '/api/users');
+check('platform admin CAN manage accounts', r.status === 200);
+r = await ps.req('GET', '/api/requests');
+check('platform admin CAN see translation-service requests', r.status === 200);
+
+// Org lifecycle: provision a fresh org, delegate an org admin, revoke.
+r = await sa.req('POST', '/api/orgs', { name: `Test Nation ${Date.now()}` });
+check('superadmin provisions an organization (becoming its owner)', r.status === 201, JSON.stringify(r.data));
+const orgId = r.data.id;
+r = await sa.req('DELETE', `/api/orgs/${orgId}/members/${(await sa.req('GET', '/api/me')).data.user.id}`);
+check('the last owner cannot be removed', r.status === 400);
+
+const oaEmail = `orgadmin-${Date.now()}@test.ca`;
+r = await sa.req('POST', '/api/users', { email: oaEmail, name: 'Org Admin', password: 'orgadmin-pass-1' });
+const oaId = r.data.user_id;
+r = await sa.req('POST', `/api/orgs/${orgId}/members`, { email: oaEmail, role: 'admin' });
+check('owner adds an org admin', r.status === 201);
+const oa = client();
+await oa.req('POST', '/api/login', { email: oaEmail, password: 'orgadmin-pass-1' });
+const orgProjName = `Org Project ${Date.now()}`;
+r = await oa.req('POST', '/api/projects', { name: orgProjName });
+check('org admin creates a project (sole-org default)', r.status === 201, JSON.stringify(r.data));
+const orgProjId = r.data?.id;
+check('project belongs to the org', r.data?.organization_id === orgId, JSON.stringify(r.data?.organization_id));
+const paEmail = `projadmin-${Date.now()}@test.ca`;
+r = await oa.req('POST', `/api/projects/${orgProjId}/members`, { email: paEmail, name: 'Proj Admin', password: 'projadmin-pass-1', role: 'admin' });
+check('org admin assigns a project admin', r.status === 201, JSON.stringify(r.data));
+r = await oa.req('POST', `/api/orgs/${orgId}/members`, { email: paEmail, role: 'member' });
+check('org admin (non-owner) cannot manage org roles', r.status === 403);
+r = await member.req('GET', `/api/orgs/${orgId}/members`);
+check('ordinary member cannot read org membership', r.status === 403);
+
+// Multi-org ambiguity: sa now administers two orgs.
+r = await sa.req('POST', '/api/projects', { name: `Ambiguous ${Date.now()}` });
+check('multi-org admin must specify organization_id', r.status === 400);
+
+// Revoking the org grant ends corpus authority immediately.
+await sa.req('DELETE', `/api/orgs/${orgId}/members/${oaId}`);
+r = await oa.req('GET', `/api/entries?project_id=${orgProjId}`);
+check('removed org admin loses corpus access immediately', r.status === 403 ||
+  (r.status === 200 && r.data.total === 0 && r.data.entries.length === 0), JSON.stringify(r.data));
+r = await oa.req('GET', `/api/projects/${orgProjId}/stats`);
+check('removed org admin gets 403 on scoped reads', r.status === 403);
+r = await oa.req('POST', '/api/projects', { name: `After Removal ${Date.now()}` });
+check('removed org admin cannot create projects', r.status === 403);
+
+// clean up: sa owns the fresh org, so it can delete the org project, then the
+// (now empty) org itself — restoring sa to a single admin org so the suite is
+// repeatable without organization_id everywhere.
+r = await sa.req('DELETE', `/api/orgs/${orgId}`);
+check('an org owning projects cannot be deleted', r.status === 400);
+r = await sa.req('DELETE', `/api/projects/${orgProjId}`, { confirm_name: orgProjName });
+check('org owner deletes the org project (cleanup)', r.status === 200, JSON.stringify(r.data));
+r = await sa.req('DELETE', `/api/orgs/${orgId}`);
+check('empty org deleted (cleanup restores single-org state)', r.status === 200, JSON.stringify(r.data));
+
 console.log(failures ? `\n${failures} FAILURES` : '\nAll checks passed.');
 process.exit(failures ? 1 : 0);
