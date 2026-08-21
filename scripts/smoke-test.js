@@ -31,6 +31,11 @@ function client() {
       else data = await res.text();
       return { status: res.status, data, headers: res.headers };
     },
+    // Binary GET — for the export ZIP, where text decoding would corrupt bytes/length.
+    async raw(method, path) {
+      const res = await fetch(BASE + path, { method, headers: cookie ? { Cookie: cookie } : {} });
+      return { status: res.status, headers: res.headers, buf: Buffer.from(await res.arrayBuffer()) };
+    },
   };
 }
 
@@ -456,6 +461,20 @@ check('JSON export includes audio refs (current master path)', r.status === 200 
 
 r = await member.req('GET', `/api/projects/${projectId}/export?format=json`);
 check('member cannot export (admin only)', r.status === 403);
+
+// --- full archive ZIP (#7) ---
+let z = await sa.raw('GET', `/api/projects/${projectId}/export-bundle`);
+check('export-bundle is a zip attachment', z.status === 200 &&
+  (z.headers.get('content-type') || '').includes('application/zip') &&
+  (z.headers.get('content-disposition') || '').includes('attachment'),
+  `${z.status} ${z.headers.get('content-type')}`);
+check('zip has PK magic', z.buf.length > 500 && z.buf[0] === 0x50 && z.buf[1] === 0x4b && z.buf[2] === 0x03 && z.buf[3] === 0x04, `len=${z.buf.length}`);
+// The bundle embeds the actual master (~48 KB WAV from makeWav(3)), so it dwarfs a metadata-only archive.
+check('archive embeds the audio bytes', z.buf.length > 40000, `len=${z.buf.length}`);
+z = await member.raw('GET', `/api/projects/${projectId}/export-bundle`);
+check('member cannot download the archive bundle', z.status === 403);
+z = await sa.raw('GET', `/api/projects/${projectId}/export-bundle?kind=word`);
+check('kind-filtered archive is a valid zip', z.status === 200 && z.buf[0] === 0x50 && z.buf[1] === 0x4b);
 
 // --- bulk CSV import (superadmin only) ---
 const csvBody = [
