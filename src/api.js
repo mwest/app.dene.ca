@@ -429,8 +429,10 @@ api.post('/orgs/:id/members', (req, res) => {
   res.status(201).json({ ok: true, user_id: user.id, role });
 });
 
-// Delete an EMPTY organization (owns no projects). Owner-only; memberships
-// cascade. An org with projects must move or delete them first.
+// Delete an EMPTY organization (owns no projects). Owner-only; memberships and
+// consent profiles cascade. Financial history (work_log/payments) must outlive
+// the org, so any rows attributed to it are detached to legacy (NULL org) —
+// they remain visible to the contributor via /me, invisible to admin views.
 api.delete('/orgs/:id', (req, res) => {
   const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
   if (!org) return bad(res, 'Organization not found', 404);
@@ -438,7 +440,11 @@ api.delete('/orgs/:id', (req, res) => {
   if (db.prepare('SELECT 1 FROM projects WHERE organization_id = ? LIMIT 1').get(org.id)) {
     return bad(res, 'This organization still owns projects — move or delete them first');
   }
-  db.prepare('DELETE FROM organizations WHERE id = ?').run(org.id);
+  db.transaction(() => {
+    db.prepare('UPDATE work_log SET organization_id = NULL WHERE organization_id = ?').run(org.id);
+    db.prepare('UPDATE payments SET organization_id = NULL WHERE organization_id = ?').run(org.id);
+    db.prepare('DELETE FROM organizations WHERE id = ?').run(org.id);
+  })();
   res.json({ ok: true });
 });
 
@@ -1014,16 +1020,25 @@ api.get('/entries', async (req, res) => {
   } else if (req.query.has_audio === 'no') {
     where.push('NOT EXISTS (SELECT 1 FROM audio_files a WHERE a.entry_id = e.id AND a.is_current = 1)');
   }
-  // needs_my_audio builds a per-speaker recording queue: entries THIS user has
-  // not yet recorded in the given language. One speaker recording an entry does
-  // not remove it from another speaker's queue, and Dene/English are independent.
+  // needs_my_audio builds a per-speaker recording queue: entries where THIS user
+  // has claimable paid recording work in the given language. That means: no
+  // current recording of mine AND no accepted (already-billed) work item for the
+  // slot — deleting a billed recording does not re-open the obligation — OR an
+  // admin-authorized rework item queued for me. Matches what a claim will offer,
+  // so dashboard counts and sessions agree. Dene/English stay independent.
   const needsMine = req.query.needs_my_audio;
   if (needsMine === 'dene' || needsMine === 'english') {
     where.push(
-      `NOT EXISTS (SELECT 1 FROM audio_files a
-                   WHERE a.entry_id = e.id AND a.uploaded_by = ? AND a.language = ? AND a.is_current = 1)`
+      `((NOT EXISTS (SELECT 1 FROM audio_files a
+                     WHERE a.entry_id = e.id AND a.uploaded_by = ? AND a.language = ? AND a.is_current = 1)
+         AND NOT EXISTS (SELECT 1 FROM work_items w WHERE w.entry_id = e.id
+                           AND w.type = 'recording' AND w.language = ? AND w.assigned_to = ?
+                           AND w.status = 'accepted'))
+        OR EXISTS (SELECT 1 FROM work_items w WHERE w.entry_id = e.id
+                     AND w.type = 'recording' AND w.language = ? AND w.assigned_to = ?
+                     AND w.status = 'queued' AND w.rework_authorized = 1))`
     );
-    params.push(req.user.id, needsMine);
+    params.push(req.user.id, needsMine, needsMine, req.user.id, needsMine, req.user.id);
   }
   if (req.query.status) {
     where.push('e.status = ?');
@@ -1099,22 +1114,15 @@ function loadEntry(req, res, next) {
   next();
 }
 
-// Compensation ledger: record one billable event, snapshotting the amount from
-// the actor's current rate for this project + work type (0 if no rate is set
-// yet — re-price later via an adjustment). Best-effort: a ledger failure must
-// never break the underlying save.
-function logWork({ userId, projectId, type, entryId = null, audioId = null }) {
-  try {
-    const rate = db
-      .prepare('SELECT rate_cents FROM translator_rates WHERE user_id = ? AND project_id = ? AND type = ?')
-      .get(userId, projectId, type);
-    db.prepare(
-      `INSERT INTO work_log (user_id, project_id, type, entry_id, audio_id, amount_cents, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(userId, projectId, type, entryId, audioId, rate?.rate_cents ?? 0, userId);
-  } catch (err) {
-    console.error('[work_log] failed to log work:', err);
+// Paid work flows EXCLUSIVELY through work items (claim -> submit ->
+// accept+bill, transactional and idempotent). The old best-effort logWork()
+// helper is gone: generic edit/upload endpoints never write ledger rows, and
+// translators are rejected from them entirely (their flow is the sessions).
+function rejectTranslators(req, res, next) {
+  if (req.projectRole === 'translator') {
+    return bad(res, 'Translators work through recording/translation sessions — paid work needs a claimed work item', 403);
   }
+  next();
 }
 
 // Project admins may edit any entry; members may edit only their own. UI hiding
@@ -1250,11 +1258,9 @@ api.delete('/entries/:id', loadEntry, (req, res) => {
   res.json({ ok: true });
 });
 
-// Fill in a phrase's missing side (the translator's translation session). Any
-// project member — including translators, who otherwise can't edit entries —
-// may complete an incomplete phrase; rewriting an already-complete phrase still
-// needs normal edit rights.
-api.post('/entries/:id/translate', loadEntry, (req, res) => {
+// Fill in a phrase's missing side directly (members/admins; unbilled). Paid
+// translation flows through work items; translators use the translation session.
+api.post('/entries/:id/translate', loadEntry, rejectTranslators, (req, res) => {
   if (req.entry.kind !== 'phrase') return bad(res, 'Only phrases can be translated here');
   const incomplete = req.entry.dene_text === '' || req.entry.english_text === '';
   if (!incomplete && !canEditEntry(req)) return bad(res, 'This phrase is already complete', 403);
@@ -1263,10 +1269,6 @@ api.post('/entries/:id/translate', loadEntry, (req, res) => {
   const nextEnglish = english_text !== undefined ? String(english_text).trim() : req.entry.english_text;
   if (!nextDene && !nextEnglish) return bad(res, 'Enter a Dene phrase or an English meaning');
   applyTranslation(req.entry, nextDene, nextEnglish, req.user.id);
-  // Bill the translation when this fills the last missing side (incomplete → complete).
-  if (incomplete && nextDene && nextEnglish) {
-    logWork({ userId: req.user.id, projectId: req.entry.project_id, type: 'translation', entryId: req.entry.id });
-  }
   res.json(db.prepare(`${entrySelect} WHERE e.id = ?`).get(...entryParams(req.user), req.entry.id));
 });
 
@@ -1367,14 +1369,15 @@ function saveMasterRecording({ entry, userId, file, probe, language, speaker, no
     }
     return id;
   })();
-  enqueueDerivative(audioId);
+  // NOTE: no derivative enqueue here — callers do it AFTER their own outer
+  // transaction commits (this function may run inside one, as a savepoint).
   return { audioId, hadCurrent: !!prior };
 }
 
 // Record (or re-record) a master. Re-recording supersedes the prior version
 // rather than replacing it — old masters are never destroyed (#8b). Billed once,
 // on the first version for a (entry, user, language) slot.
-api.post('/entries/:id/audio', loadEntry, audioUpload, async (req, res) => {
+api.post('/entries/:id/audio', loadEntry, rejectTranslators, audioUpload, async (req, res) => {
   if (!req.file) return bad(res, 'No audio file provided');
   const filePath = req.file.path;
   // Can't record an incomplete phrase — it must be translated first.
@@ -1398,10 +1401,9 @@ api.post('/entries/:id/audio', loadEntry, audioUpload, async (req, res) => {
     captureMethod: req.body.capture_method === 'browser_recording' ? 'browser_recording' : 'uploaded_file',
     captureDevice: req.body.capture_device?.trim() || null,
   });
-  // Bill once, only for the first version of this slot.
-  if (!hadCurrent) {
-    logWork({ userId: req.user.id, projectId: req.entry.project_id, type: 'recording', entryId: req.entry.id, audioId });
-  }
+  enqueueDerivative(audioId);
+  // Direct uploads are NOT billable: paid work flows exclusively through
+  // work items (claim -> submit -> accept+bill in one transaction).
   res.status(hadCurrent ? 200 : 201)
     .json({ ...db.prepare('SELECT * FROM audio_files WHERE id = ?').get(audioId), replaced: hadCurrent });
 });
@@ -1504,6 +1506,23 @@ api.delete('/audio/:id', loadAudio, (req, res) => {
     return bad(res, 'You can only delete audio you uploaded', 403);
   }
   const a = req.audio;
+  // Deleting recordings in a BILLED slot is a financial act (it interacts with
+  // the one-paid-obligation-per-slot rule): org admins only. Project-level
+  // admins and the uploader are blocked once an accepted work item exists.
+  const billed = db
+    .prepare(
+      `SELECT 1 FROM work_items WHERE entry_id = ? AND type = 'recording'
+       AND language = ? AND assigned_to = ? AND status = 'accepted' LIMIT 1`
+    )
+    .get(a.entry_id, a.language, a.uploaded_by);
+  if (billed) {
+    const org = db
+      .prepare(`SELECT p.organization_id AS oid FROM entries e JOIN projects p ON p.id = e.project_id WHERE e.id = ?`)
+      .get(a.entry_id);
+    if (!org?.oid || !isOrgAdmin(req.user, org.oid)) {
+      return bad(res, 'This recording is billed work — an organization admin must delete it (or authorize a paid re-record)', 403);
+    }
+  }
   // Deleting the CURRENT version promotes the most recent superseded version back
   // to current (so the slot is never left "has history but no current" — that
   // state would confuse the recording queue and billing). Deleting a superseded
@@ -1548,26 +1567,36 @@ function loadWorkItem(req, res, next) {
 }
 
 // Insert the ledger row for an accepted work item, snapshotting the rate at
-// accept time (matching the legacy "rate at time of work" invariant). Idempotent:
+// accept time (matching the legacy "rate at time of work" invariant). Stamps the
+// owning organization so tenant-scoped views survive project deletion. Idempotent:
 // the unique index on work_log(work_item_id) makes a repeat a silent no-op, so a
 // double-submit can never double-bill. Runs inside the caller's transaction.
-function billWorkItem(item, { entryId = null, audioId = null }) {
+function billWorkItem(item, { entryId = item.entry_id ?? null, audioId = null }) {
   const rate = db
     .prepare('SELECT rate_cents FROM translator_rates WHERE user_id = ? AND project_id = ? AND type = ?')
     .get(item.assigned_to, item.project_id, item.type);
+  const orgId = db
+    .prepare('SELECT organization_id FROM projects WHERE id = ?')
+    .get(item.project_id)?.organization_id ?? null;
   db.prepare(
-    `INSERT INTO work_log (user_id, project_id, type, entry_id, audio_id, amount_cents, work_item_id, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO work_log (user_id, project_id, type, entry_id, audio_id, amount_cents, work_item_id, organization_id, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(work_item_id) WHERE work_item_id IS NOT NULL DO NOTHING`
   ).run(item.assigned_to, item.project_id, item.type, entryId, audioId,
-        rate?.rate_cents ?? 0, item.id, item.assigned_to);
+        rate?.rate_cents ?? 0, item.id, orgId, item.assigned_to);
 }
 
-const acceptWorkItem = (id) =>
-  db.prepare(
+// Guarded accept: only a still-claimed item can transition to accepted. Throwing
+// on 0 changes (inside the caller's transaction) closes the concurrent
+// double-submit race — the loser rolls back cleanly instead of double-inserting.
+function acceptWorkItem(id) {
+  const changed = db.prepare(
     `UPDATE work_items SET status = 'accepted', submitted_at = datetime('now'),
-       reviewed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`
-  ).run(id);
+       reviewed_at = datetime('now'), updated_at = datetime('now')
+     WHERE id = ? AND status = 'claimed'`
+  ).run(id).changes;
+  if (changed === 0) throw new Error('work item is no longer claimed');
+}
 
 // Session-friendly response: the work item plus the entry (translation) or the
 // current recording for its slot (recording).
@@ -1607,14 +1636,45 @@ api.post('/projects/:id/work/claim', (req, res) => {
     .get(req.user.id, projectId, type)?.rate_cents ?? null;
 
   const claimedIds = db.transaction(() => {
-    // Free any of this user-independent pool's leases that have lapsed.
+    // Free lapsed leases. Ordinary claims are cancelled (the slot returns to the
+    // pool); ADMIN-AUTHORIZED REWORK goes back to 'queued' so the authorization
+    // survives an abandoned session instead of silently evaporating.
+    db.prepare(
+      `UPDATE work_items SET status = 'queued', claimed_at = NULL, lease_expires_at = NULL,
+         updated_at = datetime('now')
+       WHERE project_id = ? AND type = ? AND status = 'claimed' AND rework_authorized = 1
+         AND lease_expires_at < datetime('now')`
+    ).run(projectId, type);
     db.prepare(
       `UPDATE work_items SET status = 'cancelled', updated_at = datetime('now')
        WHERE project_id = ? AND type = ? AND status = 'claimed' AND lease_expires_at < datetime('now')`
     ).run(projectId, type);
 
-    let candidates;
-    if (type === 'translation') {
+    const ids = [];
+    // Step 0: adopt any admin-authorized rework queued FOR ME (these bypass the
+    // normal candidate discovery and its accepted-slot exclusion by design).
+    for (const w of db
+      .prepare(
+        `SELECT id, rate_cents FROM work_items
+         WHERE project_id = ? AND type = ? AND status = 'queued' AND assigned_to = ?
+           AND rework_authorized = 1 ${type === 'recording' ? 'AND language = ?' : ''}
+         ORDER BY id LIMIT ?`
+      )
+      .all(...(type === 'recording'
+        ? [projectId, type, req.user.id, language, limit]
+        : [projectId, type, req.user.id, limit]))) {
+      db.prepare(
+        `UPDATE work_items SET status = 'claimed', claimed_at = datetime('now'),
+           lease_expires_at = ${leaseExpr}, rate_cents = COALESCE(rate_cents, ?),
+           updated_at = datetime('now')
+         WHERE id = ? AND status = 'queued'`
+      ).run(rateCents, w.id);
+      ids.push(w.id);
+    }
+
+    const remaining = limit - ids.length;
+    let candidates = [];
+    if (remaining > 0 && type === 'translation') {
       candidates = db
         .prepare(
           `SELECT e.id FROM entries e
@@ -1624,8 +1684,11 @@ api.post('/projects/:id/work/claim', (req, res) => {
                                AND w.type = 'translation' AND w.status IN ('claimed', 'submitted'))
            ORDER BY e.updated_at DESC, e.id DESC LIMIT ?`
         )
-        .all(projectId, limit);
-    } else {
+        .all(projectId, remaining);
+    } else if (remaining > 0) {
+      // The accepted-item exclusion enforces "one paid obligation per slot":
+      // deleting a billed recording does NOT make the slot claimable again —
+      // only an admin-authorized rework item (adopted above) reopens payment.
       candidates = db
         .prepare(
           `SELECT e.id FROM entries e
@@ -1634,17 +1697,18 @@ api.post('/projects/:id/work/claim', (req, res) => {
                                AND a.uploaded_by = ? AND a.language = ? AND a.is_current = 1)
              AND NOT EXISTS (SELECT 1 FROM work_items w WHERE w.entry_id = e.id
                                AND w.type = 'recording' AND w.language = ? AND w.assigned_to = ?
-                               AND w.status IN ('claimed', 'submitted'))
+                               AND w.status IN ('claimed', 'submitted', 'accepted'))
            ORDER BY e.updated_at DESC, e.id DESC LIMIT ?`
         )
-        .all(projectId, req.user.id, language, language, req.user.id, limit);
+        .all(projectId, req.user.id, language, language, req.user.id, remaining);
     }
 
     const ins = db.prepare(
       `INSERT INTO work_items (project_id, entry_id, type, language, assigned_to, status, rate_cents, claimed_at, lease_expires_at)
        VALUES (?, ?, ?, ?, ?, 'claimed', ?, datetime('now'), ${leaseExpr})`
     );
-    return candidates.map((c) => ins.run(projectId, c.id, type, language, req.user.id, rateCents).lastInsertRowid);
+    for (const c of candidates) ids.push(ins.run(projectId, c.id, type, language, req.user.id, rateCents).lastInsertRowid);
+    return ids;
   })();
 
   if (!claimedIds.length) return res.json({ items: [] });
@@ -1708,35 +1772,103 @@ api.post('/work/:id/submit', loadWorkItem, (req, res) => {
       fs.rm(filePath, { force: true }, () => {});
       return bad(res, 'Could not read that audio file — it may be corrupt or in an unsupported format. Nothing was changed.');
     }
-    // Bill-once: if this speaker already has a CURRENT recording for this slot
-    // (e.g. they recorded it on the entry page mid-session), accept the claim
-    // without a new version or a second ledger entry.
-    const existing = db
-      .prepare('SELECT id FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ? AND is_current = 1')
-      .get(entry.id, req.user.id, language);
-    if (existing) {
-      db.transaction(() => acceptWorkItem(item.id))();
-      fs.rm(filePath, { force: true }, () => {}); // discard the duplicate upload
-    } else {
-      const { audioId } = saveMasterRecording({
-        entry, userId: req.user.id, file: req.file, probe, language,
-        speaker: req.body.speaker?.trim() || null,
-        notes: req.body.recording_notes?.trim() || null,
-        captureMethod: 'browser_recording',
-        captureDevice: req.body.capture_device?.trim() || null,
-      });
-      db.transaction(() => { acceptWorkItem(item.id); billWorkItem(item, { audioId }); })();
+    // A rework item ALWAYS records a new take (that's what the admin authorized),
+    // superseding any current audio. A normal item with a current recording for
+    // the slot (e.g. recorded on the entry page mid-session) accepts against that
+    // existing audio instead of saving a duplicate — and still bills, so an
+    // accepted item can never exist without its ledger row.
+    const existing = item.rework_authorized
+      ? null
+      : db
+          .prepare('SELECT id FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ? AND is_current = 1')
+          .get(entry.id, req.user.id, language);
+    let savedAudioId = null;
+    try {
+      db.transaction(() => {
+        if (existing) {
+          acceptWorkItem(item.id);
+          billWorkItem(item, { audioId: existing.id });
+        } else {
+          // saveMasterRecording's internal transaction nests as a SAVEPOINT here,
+          // so audio version + acceptance + ledger commit or roll back together.
+          const { audioId } = saveMasterRecording({
+            entry, userId: req.user.id, file: req.file, probe, language,
+            speaker: req.body.speaker?.trim() || null,
+            notes: req.body.recording_notes?.trim() || null,
+            captureMethod: 'browser_recording',
+            captureDevice: req.body.capture_device?.trim() || null,
+          });
+          savedAudioId = audioId;
+          acceptWorkItem(item.id);
+          billWorkItem(item, { audioId });
+        }
+      })();
+    } catch (err) {
+      fs.rm(filePath, { force: true }, () => {}); // never keep an uncommitted upload
+      console.error(`[work] recording submit for item ${item.id} rolled back:`, err.message);
+      return bad(res, 'This work item is no longer active', 409);
     }
+    if (existing) fs.rm(filePath, { force: true }, () => {}); // discard the duplicate upload
+    else if (savedAudioId) enqueueDerivative(savedAudioId);   // derivative only after commit
     return res.json(submitResult(db.prepare('SELECT * FROM work_items WHERE id = ?').get(item.id)));
   });
 });
 
 // Release a still-claimed item back to the queue (Skip / Exit a session).
+// Admin-authorized rework returns to 'queued' — skipping a rework take must not
+// destroy the authorization; ordinary claims are cancelled back to the pool.
 api.post('/work/:id/release', loadWorkItem, (req, res) => {
   if (req.workItem.status === 'claimed') {
-    db.prepare(`UPDATE work_items SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?`).run(req.workItem.id);
+    if (req.workItem.rework_authorized) {
+      db.prepare(
+        `UPDATE work_items SET status = 'queued', claimed_at = NULL, lease_expires_at = NULL,
+           updated_at = datetime('now') WHERE id = ?`
+      ).run(req.workItem.id);
+    } else {
+      db.prepare(`UPDATE work_items SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?`).run(req.workItem.id);
+    }
   }
   res.json({ ok: true });
+});
+
+// Authorize a PAID re-record of an already-billed slot (#hardening-2). Deleting
+// or superseding an accepted recording never re-opens billing by itself; an org
+// admin must explicitly create this rework item, which the speaker's next
+// recording-session claim adopts.
+api.post('/entries/:id/audio-rework', (req, res) => {
+  const entry = db.prepare('SELECT * FROM entries WHERE id = ?').get(req.params.id);
+  if (!entry) return bad(res, 'Entry not found', 404);
+  const org = db.prepare('SELECT organization_id FROM projects WHERE id = ?').get(entry.project_id);
+  if (!org?.organization_id || !isOrgAdmin(req.user, org.organization_id)) {
+    return bad(res, 'Organization admin access required', 403);
+  }
+  const userId = Number(req.body?.user_id);
+  const language = req.body?.language === 'english' ? 'english' : 'dene';
+  if (!userId || !db.prepare('SELECT 1 FROM users WHERE id = ?').get(userId)) {
+    return bad(res, 'A valid user_id is required');
+  }
+  const prior = db
+    .prepare(
+      `SELECT id FROM work_items WHERE entry_id = ? AND type = 'recording'
+       AND language = ? AND assigned_to = ? AND status = 'accepted' ORDER BY id DESC`
+    )
+    .get(entry.id, language, userId);
+  if (!prior) return bad(res, 'No accepted (billed) recording work exists for this slot — a normal claim already covers it');
+  const open = db
+    .prepare(
+      `SELECT status FROM work_items WHERE entry_id = ? AND type = 'recording'
+       AND language = ? AND assigned_to = ? AND status IN ('queued', 'claimed', 'submitted')`
+    )
+    .get(entry.id, language, userId);
+  if (open) return bad(res, `A ${open.status} work item already exists for this slot`, 409);
+  const info = db
+    .prepare(
+      `INSERT INTO work_items (project_id, entry_id, type, language, assigned_to, status,
+                               rework_authorized, rework_of_work_item_id)
+       VALUES (?, ?, 'recording', ?, ?, 'queued', 1, ?)`
+    )
+    .run(entry.project_id, entry.id, language, userId, prior.id);
+  res.status(201).json({ ok: true, work_item_id: info.lastInsertRowid, rework_of_work_item_id: prior.id });
 });
 
 // ---------------------------------------------------------------------------
@@ -2214,10 +2346,11 @@ api.get('/me/compensation', (req, res) => {
   });
 });
 
-// Compensation is ORGANIZATION authority, not platform administration: the
-// ledger quotes entry text (corpus content) and the org pays its own
-// contributors. Scoped to the orgs the caller administers. (Totals aggregate a
-// person's work across projects; fine while people work within one org.)
+// Compensation is ORGANIZATION authority, not platform administration — and
+// admin views are STRICTLY tenant-scoped: sharing one org with a contributor
+// authorizes seeing that org's slice of their work, never their whole account.
+// Scoping filters on the PERSISTED organization_id of ledger/payment rows (it
+// survives project deletion). The contributor's own /me view stays global.
 function requireAnyOrgAdmin(req, res, next) {
   const ids = adminOrgIdsFor(req.user);
   if (!ids.length) return bad(res, 'Organization admin access required', 403);
@@ -2225,59 +2358,99 @@ function requireAnyOrgAdmin(req, res, next) {
   next();
 }
 
-/** Is this user connected (membership or logged work) to a project in the
- *  caller's admin orgs? */
+const orgPh = (req) => req.adminOrgIds.map(() => '?').join(',');
+
+/** Is this user connected (membership, ledger, or payment) to the caller's
+ *  admin orgs? */
 function userInAdminOrgs(req, userId) {
-  const ph = req.adminOrgIds.map(() => '?').join(',');
+  const ph = orgPh(req);
   return !!db
     .prepare(
-      `SELECT 1 FROM projects p
-       WHERE p.organization_id IN (${ph})
-         AND (EXISTS (SELECT 1 FROM memberships m WHERE m.project_id = p.id AND m.user_id = ?)
-              OR EXISTS (SELECT 1 FROM work_log w WHERE w.project_id = p.id AND w.user_id = ?))
-       LIMIT 1`
+      `SELECT 1 WHERE EXISTS (
+         SELECT 1 FROM memberships m JOIN projects p ON p.id = m.project_id
+         WHERE m.user_id = ? AND p.organization_id IN (${ph}))
+       OR EXISTS (SELECT 1 FROM work_log w WHERE w.user_id = ? AND w.organization_id IN (${ph}))
+       OR EXISTS (SELECT 1 FROM payments py WHERE py.user_id = ? AND py.organization_id IN (${ph}))`
     )
-    .get(...req.adminOrgIds, userId, userId);
+    .get(userId, ...req.adminOrgIds, userId, ...req.adminOrgIds, userId, ...req.adminOrgIds);
+}
+
+// Org-scoped variants of the /me queries, for administrator views.
+function totalsScoped(userId, orgIds) {
+  const ph = orgIds.map(() => '?').join(',');
+  const earned = db
+    .prepare(`SELECT COALESCE(SUM(amount_cents), 0) AS c FROM work_log WHERE user_id = ? AND organization_id IN (${ph})`)
+    .get(userId, ...orgIds).c;
+  const paid = db
+    .prepare(`SELECT COALESCE(SUM(amount_cents), 0) AS c FROM payments WHERE user_id = ? AND organization_id IN (${ph})`)
+    .get(userId, ...orgIds).c;
+  return { earned_cents: earned, paid_cents: paid, balance_cents: earned - paid };
+}
+function workLogScoped(userId, orgIds) {
+  const ph = orgIds.map(() => '?').join(',');
+  return db
+    .prepare(
+      `SELECT w.id, w.type, w.amount_cents, w.note, w.created_at, w.entry_id,
+              p.name AS project_name, e.dene_text, e.english_text
+       FROM work_log w
+       LEFT JOIN projects p ON p.id = w.project_id
+       LEFT JOIN entries e ON e.id = w.entry_id
+       WHERE w.user_id = ? AND w.organization_id IN (${ph})
+       ORDER BY w.created_at DESC, w.id DESC`
+    )
+    .all(userId, ...orgIds);
+}
+function paymentsScoped(userId, orgIds) {
+  const ph = orgIds.map(() => '?').join(',');
+  return db
+    .prepare(
+      `SELECT id, amount_cents, paid_on, method, note, created_at FROM payments
+       WHERE user_id = ? AND organization_id IN (${ph})
+       ORDER BY COALESCE(paid_on, created_at) DESC, id DESC`
+    )
+    .all(userId, ...orgIds);
 }
 
 // Everyone there is money to account for in the caller's orgs: current/past
-// translators and anyone with logged work there.
+// translators and anyone with org-attributed ledger or payment history there.
 api.get('/compensation', requireAnyOrgAdmin, (req, res) => {
-  const ph = req.adminOrgIds.map(() => '?').join(',');
+  const ph = orgPh(req);
   const people = db
     .prepare(
       `SELECT u.id, u.name, u.email FROM users u
        WHERE u.id IN (SELECT m.user_id FROM memberships m JOIN projects p ON p.id = m.project_id
                        WHERE m.role = 'translator' AND p.organization_id IN (${ph}))
-          OR u.id IN (SELECT w.user_id FROM work_log w JOIN projects p ON p.id = w.project_id
-                       WHERE p.organization_id IN (${ph}))
+          OR u.id IN (SELECT w.user_id FROM work_log w WHERE w.organization_id IN (${ph}))
+          OR u.id IN (SELECT py.user_id FROM payments py WHERE py.organization_id IN (${ph}))
        ORDER BY u.name`
     )
-    .all(...req.adminOrgIds, ...req.adminOrgIds);
-  res.json({ translators: people.map((p) => ({ ...p, ...totalsFor(p.id) })) });
+    .all(...req.adminOrgIds, ...req.adminOrgIds, ...req.adminOrgIds);
+  res.json({ translators: people.map((p) => ({ ...p, ...totalsScoped(p.id, req.adminOrgIds) })) });
 });
 
 api.get('/compensation/:userId', requireAnyOrgAdmin, (req, res) => {
   const user = db.prepare('SELECT id, name, email FROM users WHERE id = ?').get(req.params.userId);
   if (!user) return bad(res, 'User not found', 404);
   if (!userInAdminOrgs(req, user.id)) return bad(res, 'Organization admin access required', 403);
+  const ph = orgPh(req);
   const rates = db
     .prepare(
       `SELECT r.project_id, p.name AS project_name, r.type, r.rate_cents, r.updated_at
        FROM translator_rates r JOIN projects p ON p.id = r.project_id
-       WHERE r.user_id = ? ORDER BY p.name, r.type`
+       WHERE r.user_id = ? AND p.organization_id IN (${ph}) ORDER BY p.name, r.type`
     )
-    .all(user.id);
-  const work = workLogFor.all(user.id);
-  const payments = paymentsFor.all(user.id);
-  // Projects the person belongs to — the set you can set rates for.
+    .all(user.id, ...req.adminOrgIds);
+  const work = workLogScoped(user.id, req.adminOrgIds);
+  const payments = paymentsScoped(user.id, req.adminOrgIds);
+  // Projects the person belongs to WITHIN the caller's orgs — the set rates
+  // can be managed for.
   const projects = db
     .prepare(
       `SELECT p.id, p.name FROM projects p JOIN memberships m ON m.project_id = p.id
-       WHERE m.user_id = ? ORDER BY p.name`
+       WHERE m.user_id = ? AND p.organization_id IN (${ph}) ORDER BY p.name`
     )
-    .all(user.id);
-  res.json({ user, ...totalsFor(user.id), rates, work, payments, projects });
+    .all(user.id, ...req.adminOrgIds);
+  res.json({ user, ...totalsScoped(user.id, req.adminOrgIds), rates, work, payments, projects });
 });
 
 // Set or change a per-project rate; logs an audit row.
@@ -2310,22 +2483,41 @@ api.put('/compensation/:userId/rates', requireAnyOrgAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-// Record a payment already made offline (the app never moves money).
+// Resolve which org a new payment/adjustment is on behalf of: the caller's sole
+// admin org by default, else an explicit organization_id from the body
+// (validated against the caller's admin orgs). Mirrors POST /projects.
+function resolveMoneyOrg(req, res) {
+  let orgId = req.body?.organization_id ? Number(req.body.organization_id) : null;
+  if (orgId) {
+    if (!req.adminOrgIds.includes(orgId)) { bad(res, 'Organization admin access required', 403); return null; }
+  } else if (req.adminOrgIds.length === 1) {
+    orgId = req.adminOrgIds[0];
+  } else {
+    bad(res, 'You administer multiple organizations — specify organization_id'); return null;
+  }
+  return orgId;
+}
+
+// Record a payment already made offline (the app never moves money). Stamped
+// with the paying organization for tenant scoping.
 api.post('/compensation/:userId/payments', requireAnyOrgAdmin, (req, res) => {
   const user = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.userId);
   if (!user) return bad(res, 'User not found', 404);
   if (!userInAdminOrgs(req, user.id)) return bad(res, 'Organization admin access required', 403);
+  const orgId = resolveMoneyOrg(req, res);
+  if (!orgId) return;
   const amount = Math.round(Number(req.body?.amount_cents));
   if (!Number.isFinite(amount) || amount <= 0) return bad(res, 'Payment amount must be greater than zero');
   const paidOn = req.body?.paid_on?.trim() || new Date().toISOString().slice(0, 10);
   db.prepare(
-    `INSERT INTO payments (user_id, amount_cents, paid_on, method, note, recorded_by)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(user.id, amount, paidOn, req.body?.method?.trim() || null, req.body?.note?.trim() || null, req.user.id);
-  res.status(201).json({ ok: true, ...totalsFor(user.id) });
+    `INSERT INTO payments (user_id, amount_cents, paid_on, method, note, organization_id, recorded_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(user.id, amount, paidOn, req.body?.method?.trim() || null, req.body?.note?.trim() || null, orgId, req.user.id);
+  res.status(201).json({ ok: true, ...totalsScoped(user.id, req.adminOrgIds) });
 });
 
 // Manual ledger adjustment (+/-): bonuses, corrections, pricing unrated work.
+// A project is required so the adjustment is org-attributable.
 api.post('/compensation/:userId/adjustments', requireAnyOrgAdmin, (req, res) => {
   const user = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.userId);
   if (!user) return bad(res, 'User not found', 404);
@@ -2334,18 +2526,17 @@ api.post('/compensation/:userId/adjustments', requireAnyOrgAdmin, (req, res) => 
   if (!Number.isFinite(amount) || amount === 0) return bad(res, 'Adjustment amount cannot be zero');
   const note = req.body?.note?.trim();
   if (!note) return bad(res, 'An adjustment note is required');
-  const projectId = req.body?.project_id ? Number(req.body.project_id) : null;
-  if (projectId) {
-    const proj = db.prepare('SELECT organization_id FROM projects WHERE id = ?').get(projectId);
-    if (!proj || !req.adminOrgIds.includes(proj.organization_id)) {
-      return bad(res, 'Organization admin access required', 403);
-    }
+  const projectId = Number(req.body?.project_id);
+  const proj = projectId ? db.prepare('SELECT organization_id FROM projects WHERE id = ?').get(projectId) : null;
+  if (!proj) return bad(res, 'A project is required so the adjustment is attributed to an organization');
+  if (!req.adminOrgIds.includes(proj.organization_id)) {
+    return bad(res, 'Organization admin access required', 403);
   }
   db.prepare(
-    `INSERT INTO work_log (user_id, project_id, type, amount_cents, note, created_by)
-     VALUES (?, ?, 'adjustment', ?, ?, ?)`
-  ).run(user.id, projectId, amount, note, req.user.id);
-  res.status(201).json({ ok: true, ...totalsFor(user.id) });
+    `INSERT INTO work_log (user_id, project_id, type, amount_cents, note, organization_id, created_by)
+     VALUES (?, ?, 'adjustment', ?, ?, ?, ?)`
+  ).run(user.id, projectId, amount, note, proj.organization_id, req.user.id);
+  res.status(201).json({ ok: true, ...totalsScoped(user.id, req.adminOrgIds) });
 });
 
 // ---------------------------------------------------------------------------

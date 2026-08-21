@@ -243,6 +243,10 @@ CREATE TABLE IF NOT EXISTS work_log (
   -- legacy rows and manual adjustments). Intentionally NOT a foreign key: ledger
   -- rows must outlive the work_item/entry they came from (money already earned).
   work_item_id INTEGER,
+  -- Owning organization, PERSISTED (not derived via the projects join) because
+  -- project_id is ON DELETE SET NULL — attribution must survive project deletion
+  -- so org-scoped admin views stay complete. NULL = pre-org legacy.
+  organization_id INTEGER REFERENCES organizations(id),
   created_by  INTEGER NOT NULL REFERENCES users(id),
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -255,6 +259,9 @@ CREATE TABLE IF NOT EXISTS payments (
   paid_on     TEXT,
   method      TEXT,
   note        TEXT,
+  -- The organization the payment was made on behalf of (tenant scoping).
+  -- NULL = pre-org legacy: hidden from admin views, still in the contributor's /me.
+  organization_id INTEGER REFERENCES organizations(id),
   recorded_by INTEGER NOT NULL REFERENCES users(id),
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -286,12 +293,16 @@ CREATE TABLE IF NOT EXISTS work_items (
   assigned_to      INTEGER REFERENCES users(id) ON DELETE SET NULL,
   status           TEXT NOT NULL CHECK (status IN
                      ('queued', 'claimed', 'submitted', 'accepted', 'rejected', 'cancelled')),
-  rate_cents       INTEGER,  -- estimate captured at claim; NOT authoritative (billing uses the accept-time rate)
+  rate_cents       INTEGER,  -- rate snapshot captured at claim/adoption
   claimed_at       TEXT,
   lease_expires_at TEXT,
   submitted_at     TEXT,
   reviewed_at      TEXT,
   reviewed_by      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  -- Paid rework: an accepted (billed) slot can only be paid again through an
+  -- admin-authorized rework item referencing the work it redoes.
+  rework_authorized     INTEGER NOT NULL DEFAULT 0,
+  rework_of_work_item_id INTEGER,
   created_at       TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -306,6 +317,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_wi_translation_active
 CREATE UNIQUE INDEX IF NOT EXISTS idx_wi_recording_active
   ON work_items(entry_id, language, assigned_to)
   WHERE type = 'recording' AND status IN ('claimed', 'submitted');
+-- At most one PENDING rework authorization per slot — a duplicate would abort
+-- the claim transaction when both try to become claimed.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wi_recording_queued_rework
+  ON work_items(entry_id, language, assigned_to)
+  WHERE type = 'recording' AND status = 'queued';
 `);
 
 // Migration: language tag on recordings ('dene' or 'english').
@@ -454,6 +470,43 @@ if (db.prepare(`SELECT 1 FROM projects WHERE organization_id IS NULL LIMIT 1`).g
     }
   })();
 }
+
+// Migration (hardening): paid-rework columns on work_items, and persisted
+// organization attribution on the money tables (work_log/payments) so tenant
+// scoping survives project deletion (work_log.project_id is ON DELETE SET NULL).
+const wiCols = db.prepare(`PRAGMA table_info(work_items)`).all().map((c) => c.name);
+if (!wiCols.includes('rework_authorized')) {
+  db.exec(`ALTER TABLE work_items ADD COLUMN rework_authorized INTEGER NOT NULL DEFAULT 0`);
+}
+if (!wiCols.includes('rework_of_work_item_id')) {
+  db.exec(`ALTER TABLE work_items ADD COLUMN rework_of_work_item_id INTEGER`);
+}
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_wi_recording_queued_rework
+         ON work_items(entry_id, language, assigned_to)
+         WHERE type = 'recording' AND status = 'queued'`);
+
+const wlCols2 = db.prepare(`PRAGMA table_info(work_log)`).all().map((c) => c.name);
+if (!wlCols2.includes('organization_id')) {
+  db.exec(`ALTER TABLE work_log ADD COLUMN organization_id INTEGER REFERENCES organizations(id)`);
+}
+const payCols = db.prepare(`PRAGMA table_info(payments)`).all().map((c) => c.name);
+if (!payCols.includes('organization_id')) {
+  db.exec(`ALTER TABLE payments ADD COLUMN organization_id INTEGER REFERENCES organizations(id)`);
+}
+// Backfill attribution: rows tied to a live project take that project's org; the
+// remainder (NULL project — old adjustments, orphans, and all old payments) can
+// be mapped safely only when a SINGLE organization exists. In a multi-org world
+// unmappable rows stay NULL = legacy: hidden from admin views, visible in /me.
+db.transaction(() => {
+  db.exec(`UPDATE work_log SET organization_id =
+             (SELECT p.organization_id FROM projects p WHERE p.id = work_log.project_id)
+           WHERE organization_id IS NULL AND project_id IS NOT NULL`);
+  const orgs = db.prepare(`SELECT id FROM organizations`).all();
+  if (orgs.length === 1) {
+    db.prepare(`UPDATE work_log SET organization_id = ? WHERE organization_id IS NULL`).run(orgs[0].id);
+    db.prepare(`UPDATE payments SET organization_id = ? WHERE organization_id IS NULL`).run(orgs[0].id);
+  }
+})();
 
 export default db;
 

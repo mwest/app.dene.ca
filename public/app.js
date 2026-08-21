@@ -1169,8 +1169,20 @@ async function renderEntryDetail(id) {
   };
   const others = entry.audio.filter((a) => a.uploaded_by !== myId);
 
+  // Translators record only through their sessions (paid work needs a claimed
+  // work item — hardening #5): show their recordings read-only, no slots/upload.
+  const translatorHere = entry.role === 'translator';
   // An incomplete phrase can't be recorded yet — show a prompt instead of slots.
-  const recordingsCard = incomplete ? `
+  const recordingsCard = translatorHere ? `
+    <div class="card">
+      <div id="audio-list">
+        <h2 style="margin-top:0">Recordings</h2>
+        ${entry.audio.length ? entry.audio.map((a) => audioItemHtml(a, entry)).join('')
+          : '<p class="form-hint">No recordings yet.</p>'}
+      </div>
+      <p class="form-hint" style="margin-top:0.6rem">Recording happens in your
+        <a href="#/dashboard">recording session</a> — paid work is claimed there.</p>
+    </div>` : incomplete ? `
     <div class="card">
       <h2 style="margin-top:0">Recordings</h2>
       <p class="form-hint">Add the translation above before recording this phrase.</p>
@@ -1279,7 +1291,7 @@ async function renderEntryDetail(id) {
   });
 
   // --- microphone recording (only when the recording slots are present) ---
-  if (!incomplete) setupRecorder(entry);
+  if (!incomplete && !translatorHere) setupRecorder(entry);
 
   // --- audio upload ---
   $('#audio-form')?.addEventListener('submit', async (e) => {
@@ -1334,6 +1346,15 @@ async function renderEntryDetail(id) {
               </div>`).join('')
           : '<div class="empty small">No previous versions — this is the first recording.</div>';
       } catch (err) { box.innerHTML = `<div class="empty small">${esc(err.message)}</div>`; }
+    } else if (action === 'rework') {
+      if (!confirm('Authorize a PAID re-record of this slot? The speaker\'s next recording session will offer it, and the new take will be billed as a second payment.')) return;
+      try {
+        await api(`/entries/${btn.dataset.entry}/audio-rework`, {
+          method: 'POST',
+          body: { user_id: Number(btn.dataset.user), language: btn.dataset.lang },
+        });
+        toast('Paid re-record authorized — it will appear in the speaker\'s next session');
+      } catch (err) { toast(err.message, true); }
     } else if (action === 'revoke') {
       const note = prompt('Revoke consent on this recording? It stays in the archive but is excluded from purpose-filtered exports and public use. Optional note (e.g. who withdrew consent):');
       if (note === null) return;
@@ -1510,6 +1531,7 @@ function audioItemHtml(a, entry) {
         <button type="button" class="ghost small" data-action="history" data-id="${a.id}">Previous versions</button>
         <button type="button" class="ghost small" data-action="edit-meta" data-id="${a.id}">Edit details</button>
         ${isOrgAdmin() && !a.revoked_at ? `<button type="button" class="danger small" data-action="revoke" data-id="${a.id}">Revoke consent</button>` : ''}
+        ${isOrgAdmin() ? `<button type="button" class="ghost small" data-action="rework" data-id="${a.id}" data-user="${a.uploaded_by}" data-lang="${a.language}" data-entry="${a.entry_id}" title="Authorize a PAID re-record of this billed slot">Authorize re-record</button>` : ''}
         <button type="button" class="danger small" data-action="delete" data-id="${a.id}">Delete</button>
       </div>
       <div class="audio-versions" id="versions-${a.id}" hidden></div>` : ''}
