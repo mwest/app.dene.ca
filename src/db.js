@@ -61,6 +61,39 @@ CREATE TABLE IF NOT EXISTS organization_memberships (
   PRIMARY KEY (organization_id, user_id)
 );
 
+-- Consent profiles (#6): reusable, org-owned bundles of permitted uses.
+-- Profiles are EDITABLE, but recordings carry an immutable SNAPSHOT of the
+-- permissions at assignment time — editing a profile never silently rewrites
+-- the consent basis of existing recordings.
+CREATE TABLE IF NOT EXISTS consent_profiles (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  name            TEXT NOT NULL,
+  visibility      TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private', 'public')),
+  allow_language_learning         INTEGER NOT NULL DEFAULT 0,
+  allow_asr_training              INTEGER NOT NULL DEFAULT 0,
+  allow_tts_training              INTEGER NOT NULL DEFAULT 0,
+  allow_translation_model_training INTEGER NOT NULL DEFAULT 0,
+  allow_research                  INTEGER NOT NULL DEFAULT 0,
+  allow_commercial_use            INTEGER NOT NULL DEFAULT 0,
+  allow_redistribution            INTEGER NOT NULL DEFAULT 0,
+  notes           TEXT,
+  created_by      INTEGER NOT NULL REFERENCES users(id),
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (organization_id, name)
+);
+
+-- Audit trail for consent assignment and revocation on recordings.
+CREATE TABLE IF NOT EXISTS consent_changes (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  audio_id     INTEGER REFERENCES audio_files(id) ON DELETE SET NULL,
+  action       TEXT NOT NULL CHECK (action IN ('assign', 'revoke')),
+  profile_name TEXT,
+  note         TEXT,
+  changed_by   INTEGER NOT NULL REFERENCES users(id),
+  changed_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS projects (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   name        TEXT NOT NULL UNIQUE,
@@ -71,6 +104,9 @@ CREATE TABLE IF NOT EXISTS projects (
   -- Owning organization. Nullable in SQL for migration order; the API requires
   -- it on every new project.
   organization_id INTEGER REFERENCES organizations(id),
+  -- Default consent profile stamped onto new recordings (#6); NULL = new
+  -- recordings start consent-unknown until an admin assigns permissions.
+  default_consent_profile_id INTEGER REFERENCES consent_profiles(id),
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -131,7 +167,24 @@ CREATE TABLE IF NOT EXISTS audio_files (
   playback_stored_name TEXT,
   playback_mime_type   TEXT,
   capture_method       TEXT,     -- 'browser_recording' | 'uploaded_file'
-  capture_device       TEXT
+  capture_device       TEXT,
+  -- Consent snapshot (#6): permissions carried BY the recording, stamped at
+  -- assignment/recording time from a consent profile. NULL allow_* columns mean
+  -- consent-unknown — excluded from purpose-filtered exports until assigned.
+  consent_profile_name TEXT,
+  allow_language_learning          INTEGER,
+  allow_asr_training               INTEGER,
+  allow_tts_training               INTEGER,
+  allow_translation_model_training INTEGER,
+  allow_research                   INTEGER,
+  allow_commercial_use             INTEGER,
+  allow_redistribution             INTEGER,
+  consent_recorded_at  TEXT,
+  consent_method       TEXT,     -- 'project_default_profile' | 'bulk_assign'
+  consent_reference    TEXT,
+  restrictions_notes   TEXT,
+  revoked_at           TEXT,
+  revoked_by           INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_audio_entry ON audio_files(entry_id);
 
@@ -348,6 +401,32 @@ if (!workLogCols.includes('work_item_id')) {
 }
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_work_log_item
          ON work_log(work_item_id) WHERE work_item_id IS NOT NULL`);
+
+// Migration (#6): consent snapshot columns on recordings + the project default
+// profile pointer. All nullable — existing recordings stay consent-unknown until
+// an org admin assigns a profile (bulk or per project default going forward).
+for (const [col, ddl] of [
+  ['consent_profile_name', `ALTER TABLE audio_files ADD COLUMN consent_profile_name TEXT`],
+  ['allow_language_learning', `ALTER TABLE audio_files ADD COLUMN allow_language_learning INTEGER`],
+  ['allow_asr_training', `ALTER TABLE audio_files ADD COLUMN allow_asr_training INTEGER`],
+  ['allow_tts_training', `ALTER TABLE audio_files ADD COLUMN allow_tts_training INTEGER`],
+  ['allow_translation_model_training', `ALTER TABLE audio_files ADD COLUMN allow_translation_model_training INTEGER`],
+  ['allow_research', `ALTER TABLE audio_files ADD COLUMN allow_research INTEGER`],
+  ['allow_commercial_use', `ALTER TABLE audio_files ADD COLUMN allow_commercial_use INTEGER`],
+  ['allow_redistribution', `ALTER TABLE audio_files ADD COLUMN allow_redistribution INTEGER`],
+  ['consent_recorded_at', `ALTER TABLE audio_files ADD COLUMN consent_recorded_at TEXT`],
+  ['consent_method', `ALTER TABLE audio_files ADD COLUMN consent_method TEXT`],
+  ['consent_reference', `ALTER TABLE audio_files ADD COLUMN consent_reference TEXT`],
+  ['restrictions_notes', `ALTER TABLE audio_files ADD COLUMN restrictions_notes TEXT`],
+  ['revoked_at', `ALTER TABLE audio_files ADD COLUMN revoked_at TEXT`],
+  ['revoked_by', `ALTER TABLE audio_files ADD COLUMN revoked_by INTEGER`],
+]) {
+  if (!audioCols.includes(col)) db.exec(ddl);
+}
+const projCols6 = db.prepare(`PRAGMA table_info(projects)`).all().map((c) => c.name);
+if (!projCols6.includes('default_consent_profile_id')) {
+  db.exec(`ALTER TABLE projects ADD COLUMN default_consent_profile_id INTEGER REFERENCES consent_profiles(id)`);
+}
 
 // Migration (#5): explicit data ownership. Attach any pre-organization projects
 // to a default org and grant owner_admin to every superadmin AT THIS MOMENT —

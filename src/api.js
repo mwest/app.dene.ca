@@ -462,6 +462,137 @@ api.delete('/orgs/:id/members/:userId', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Consent profiles (#6) — org-owned bundles of permitted uses. Recordings carry
+// an immutable snapshot; editing a profile never rewrites past consent.
+// ---------------------------------------------------------------------------
+
+const CONSENT_FLAGS = [
+  'allow_language_learning', 'allow_asr_training', 'allow_tts_training',
+  'allow_translation_model_training', 'allow_research', 'allow_commercial_use',
+  'allow_redistribution',
+];
+
+api.get('/orgs/:id/consent-profiles', (req, res) => {
+  const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
+  if (!org) return bad(res, 'Organization not found', 404);
+  if (!isOrgAdmin(req.user, org.id)) return bad(res, 'Organization admin access required', 403);
+  res.json({ profiles: db.prepare('SELECT * FROM consent_profiles WHERE organization_id = ? ORDER BY name').all(org.id) });
+});
+
+api.post('/orgs/:id/consent-profiles', (req, res) => {
+  const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
+  if (!org) return bad(res, 'Organization not found', 404);
+  if (!isOrgAdmin(req.user, org.id)) return bad(res, 'Organization admin access required', 403);
+  const name = String(req.body?.name ?? '').trim();
+  if (!name) return bad(res, 'Profile name is required');
+  const flags = CONSENT_FLAGS.map((f) => (req.body?.[f] ? 1 : 0));
+  try {
+    const info = db.prepare(
+      `INSERT INTO consent_profiles (organization_id, name, visibility, ${CONSENT_FLAGS.join(', ')}, notes, created_by)
+       VALUES (?, ?, ?, ${CONSENT_FLAGS.map(() => '?').join(', ')}, ?, ?)`
+    ).run(org.id, name, req.body?.visibility === 'public' ? 'public' : 'private',
+          ...flags, req.body?.notes?.trim() || null, req.user.id);
+    res.status(201).json(db.prepare('SELECT * FROM consent_profiles WHERE id = ?').get(info.lastInsertRowid));
+  } catch (e) {
+    if (String(e.message).includes('UNIQUE')) return bad(res, 'A profile with that name already exists in this organization');
+    throw e;
+  }
+});
+
+function loadConsentProfile(req, res, next) {
+  const profile = db.prepare('SELECT * FROM consent_profiles WHERE id = ?').get(req.params.id);
+  if (!profile) return bad(res, 'Consent profile not found', 404);
+  if (!isOrgAdmin(req.user, profile.organization_id)) return bad(res, 'Organization admin access required', 403);
+  req.consentProfile = profile;
+  next();
+}
+
+api.patch('/consent-profiles/:id', loadConsentProfile, (req, res) => {
+  const p = req.consentProfile;
+  const name = req.body?.name !== undefined ? String(req.body.name).trim() : p.name;
+  if (!name) return bad(res, 'Profile name is required');
+  const flags = CONSENT_FLAGS.map((f) => (req.body?.[f] !== undefined ? (req.body[f] ? 1 : 0) : p[f]));
+  db.prepare(
+    `UPDATE consent_profiles SET name = ?, visibility = ?, ${CONSENT_FLAGS.map((f) => `${f} = ?`).join(', ')}, notes = ?
+     WHERE id = ?`
+  ).run(name, req.body?.visibility === undefined ? p.visibility : (req.body.visibility === 'public' ? 'public' : 'private'),
+        ...flags, req.body?.notes !== undefined ? (req.body.notes?.trim() || null) : p.notes, p.id);
+  res.json(db.prepare('SELECT * FROM consent_profiles WHERE id = ?').get(p.id));
+});
+
+api.delete('/consent-profiles/:id', loadConsentProfile, (req, res) => {
+  // Snapshots on recordings reference the profile only by NAME, so they are
+  // untouched; clear project defaults that point at it before deleting.
+  db.transaction(() => {
+    db.prepare('UPDATE projects SET default_consent_profile_id = NULL WHERE default_consent_profile_id = ?')
+      .run(req.consentProfile.id);
+    db.prepare('DELETE FROM consent_profiles WHERE id = ?').run(req.consentProfile.id);
+  })();
+  res.json({ ok: true });
+});
+
+// Choose (or clear) the profile stamped onto NEW recordings in this project.
+api.put('/projects/:id/consent-default', requireOrgAdminOfProject, (req, res) => {
+  const profileId = req.body?.profile_id ? Number(req.body.profile_id) : null;
+  if (profileId) {
+    const profile = db.prepare('SELECT * FROM consent_profiles WHERE id = ?').get(profileId);
+    if (!profile || profile.organization_id !== req.project.organization_id) {
+      return bad(res, 'The profile must belong to the project’s organization');
+    }
+  }
+  db.prepare('UPDATE projects SET default_consent_profile_id = ? WHERE id = ?').run(profileId, req.project.id);
+  res.json({ ok: true, default_consent_profile_id: profileId });
+});
+
+// Bulk-assign a profile snapshot to this project's consent-UNKNOWN recordings
+// (already-assigned and revoked recordings are never touched). One audit row per
+// recording, all in one transaction.
+api.post('/projects/:id/consent/assign', requireOrgAdminOfProject, (req, res) => {
+  const profile = db.prepare('SELECT * FROM consent_profiles WHERE id = ?').get(Number(req.body?.profile_id));
+  if (!profile || profile.organization_id !== req.project.organization_id) {
+    return bad(res, 'A consent profile from the project’s organization is required');
+  }
+  const language = req.body?.language === 'dene' || req.body?.language === 'english' ? req.body.language : null;
+  const targets = db
+    .prepare(
+      `SELECT a.id FROM audio_files a JOIN entries e ON e.id = a.entry_id
+       WHERE e.project_id = ? AND a.consent_profile_name IS NULL AND a.revoked_at IS NULL
+         ${language ? 'AND a.language = ?' : ''}`
+    )
+    .all(...(language ? [req.project.id, language] : [req.project.id]));
+  const stamp = db.prepare(
+    `UPDATE audio_files SET consent_profile_name = ?, ${CONSENT_FLAGS.map((f) => `${f} = ?`).join(', ')},
+       consent_recorded_at = datetime('now'), consent_method = 'bulk_assign', consent_reference = ?
+     WHERE id = ?`
+  );
+  const audit = db.prepare(
+    `INSERT INTO consent_changes (audio_id, action, profile_name, note, changed_by) VALUES (?, 'assign', ?, ?, ?)`
+  );
+  const note = req.body?.note?.trim() || null;
+  db.transaction(() => {
+    for (const t of targets) {
+      stamp.run(profile.name, ...CONSENT_FLAGS.map((f) => profile[f]), note, t.id);
+      audit.run(t.id, profile.name, note, req.user.id);
+    }
+  })();
+  res.json({ ok: true, assigned: targets.length, profile: profile.name });
+});
+
+// Consent snapshot for new recordings in a project (NULL = consent-unknown).
+function consentSnapshotFor(projectId) {
+  const row = db
+    .prepare(
+      `SELECT cp.* FROM projects p JOIN consent_profiles cp ON cp.id = p.default_consent_profile_id
+       WHERE p.id = ?`
+    )
+    .get(projectId);
+  if (!row) return null;
+  const snap = { consent_profile_name: row.name, consent_method: 'project_default_profile' };
+  for (const f of CONSENT_FLAGS) snap[f] = row[f];
+  return snap;
+}
+
+// ---------------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------------
 
@@ -1208,9 +1339,12 @@ function saveMasterRecording({ entry, userId, file, probe, language, speaker, no
   const prior = db
     .prepare('SELECT id FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ? AND is_current = 1')
     .get(entry.id, userId, language);
+  // Stamp the project's default consent profile (if any) onto the new version at
+  // save time — the recording carries its own immutable permission snapshot (#6).
+  const consent = consentSnapshotFor(entry.project_id);
   const audioId = db.transaction(() => {
     if (prior) db.prepare('UPDATE audio_files SET is_current = 0 WHERE id = ?').run(prior.id);
-    return db
+    const id = db
       .prepare(
         `INSERT INTO audio_files
            (entry_id, stored_name, original_name, mime_type, size_bytes, duration_seconds,
@@ -1225,6 +1359,13 @@ function saveMasterRecording({ entry, userId, file, probe, language, speaker, no
         prior?.id ?? null, probe.sampleRate, probe.channels, probe.bitDepth, probe.codec,
         captureMethod || null, captureDevice || null
       ).lastInsertRowid;
+    if (consent) {
+      db.prepare(
+        `UPDATE audio_files SET consent_profile_name = ?, ${CONSENT_FLAGS.map((f) => `${f} = ?`).join(', ')},
+           consent_recorded_at = datetime('now'), consent_method = ? WHERE id = ?`
+      ).run(consent.consent_profile_name, ...CONSENT_FLAGS.map((f) => consent[f]), consent.consent_method, id);
+    }
+    return id;
   })();
   enqueueDerivative(audioId);
   return { audioId, hadCurrent: !!prior };
@@ -1320,6 +1461,29 @@ api.get('/audio/:id/history', loadAudio, (req, res) => {
     )
     .all(req.audio.entry_id, req.audio.uploaded_by, req.audio.language);
   res.json({ versions });
+});
+
+// Revoke consent on a recording (#6). Organization-admin only, audited. The
+// asset stays in the archive (flagged) but is excluded from purpose-filtered
+// exports and any future public/AI-training surface. Physical deletion remains
+// a separate, explicit action under the owner's policy.
+api.post('/audio/:id/revoke', loadAudio, (req, res) => {
+  const org = db
+    .prepare('SELECT p.organization_id AS oid FROM entries e JOIN projects p ON p.id = e.project_id WHERE e.id = ?')
+    .get(req.audio.entry_id);
+  if (!org?.oid || !isOrgAdmin(req.user, org.oid)) {
+    return bad(res, 'Organization admin access required', 403);
+  }
+  if (req.audio.revoked_at) return bad(res, 'This recording is already revoked');
+  const note = req.body?.note?.trim() || null;
+  db.transaction(() => {
+    db.prepare(`UPDATE audio_files SET revoked_at = datetime('now'), revoked_by = ? WHERE id = ?`)
+      .run(req.user.id, req.audio.id);
+    db.prepare(`INSERT INTO consent_changes (audio_id, action, profile_name, note, changed_by)
+                VALUES (?, 'revoke', ?, ?, ?)`)
+      .run(req.audio.id, req.audio.consent_profile_name, note, req.user.id);
+  })();
+  res.json(db.prepare('SELECT * FROM audio_files WHERE id = ?').get(req.audio.id));
 });
 
 api.patch('/audio/:id', loadAudio, (req, res) => {
@@ -1658,10 +1822,29 @@ const csvEsc = (v) => {
 };
 const sha256Hex = (str) => crypto.createHash('sha256').update(str).digest('hex');
 
+// Purpose-filtered exports (#6): each purpose maps to one consent flag. A
+// recording is included only when its SNAPSHOT explicitly allows the purpose and
+// it is not revoked — permission is never inferred from membership/visibility,
+// and consent-unknown recordings are excluded.
+const EXPORT_PURPOSES = {
+  learning: 'allow_language_learning',
+  asr: 'allow_asr_training',
+  tts: 'allow_tts_training',
+  translation_model: 'allow_translation_model_training',
+  research: 'allow_research',
+  commercial: 'allow_commercial_use',
+  redistribution: 'allow_redistribution',
+};
+
 api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => {
   const kind = req.query.kind === 'word' || req.query.kind === 'phrase' ? req.query.kind : null;
   const kindSql = kind ? ' AND e.kind = ?' : '';
   const kindArg = kind ? [kind] : [];
+  const purpose = req.query.purpose ? String(req.query.purpose) : null;
+  if (purpose && !EXPORT_PURPOSES[purpose]) {
+    return bad(res, `Unknown purpose — use one of: ${Object.keys(EXPORT_PURPOSES).join(', ')}`);
+  }
+  const purposeSql = purpose ? ` AND a.${EXPORT_PURPOSES[purpose]} = 1 AND a.revoked_at IS NULL` : '';
 
   const rows = db
     .prepare(
@@ -1676,10 +1859,26 @@ api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => 
       `SELECT a.*, uu.name AS uploaded_by_name FROM audio_files a
        JOIN entries e ON e.id = a.entry_id
        JOIN users uu ON uu.id = a.uploaded_by
-       WHERE e.project_id = ? AND a.is_current = 1${kindSql}
+       WHERE e.project_id = ? AND a.is_current = 1${kindSql}${purposeSql}
        ORDER BY a.entry_id, a.language, a.id`
     )
     .all(req.project.id, ...kindArg);
+  // Consent census over ALL current recordings in scope (pre purpose filter),
+  // so the manifest states what was excluded and why.
+  const census = db
+    .prepare(
+      `SELECT
+         SUM(CASE WHEN a.revoked_at IS NOT NULL THEN 1 ELSE 0 END) AS revoked,
+         SUM(CASE WHEN a.revoked_at IS NULL AND a.consent_profile_name IS NULL THEN 1 ELSE 0 END) AS consent_unknown,
+         SUM(CASE WHEN a.revoked_at IS NULL AND a.consent_profile_name IS NOT NULL THEN 1 ELSE 0 END) AS consented,
+         COUNT(*) AS total
+       FROM audio_files a JOIN entries e ON e.id = a.entry_id
+       WHERE e.project_id = ? AND a.is_current = 1${kindSql}`
+    )
+    .get(req.project.id, ...kindArg);
+  const orgRow = req.project.organization_id
+    ? db.prepare('SELECT id, name, slug FROM organizations WHERE id = ?').get(req.project.organization_id)
+    : null;
 
   // Pre-scan files BEFORE we start streaming (headers commit on first byte): collect
   // the include-list, checksums, and per-entry audio refs; skip any missing files.
@@ -1720,6 +1919,15 @@ api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => 
       archive_class: a.archive_class, duration_seconds: a.duration_seconds,
       sample_rate_hz: a.sample_rate_hz, channels: a.channels, bit_depth: a.bit_depth, codec: a.codec,
       sha256: sha ?? null, file: bundlePath, derivative: derivPath,
+      consent: a.consent_profile_name
+        ? {
+            profile: a.consent_profile_name,
+            method: a.consent_method,
+            recorded_at: a.consent_recorded_at,
+            permissions: Object.fromEntries(CONSENT_FLAGS.map((f) => [f, !!a[f]])),
+            revoked_at: a.revoked_at,
+          }
+        : { profile: null, status: a.revoked_at ? 'revoked' : 'consent_unknown', revoked_at: a.revoked_at },
     });
   }
 
@@ -1748,19 +1956,28 @@ api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => 
   }, null, 2);
   const recordingsJsonStr = JSON.stringify({ recordings: recordingsJson }, null, 2);
   const manifest = {
-    schema_version: '1.0',
+    schema_version: '1.1',
     exported_at: new Date().toISOString(),
     application_version: pkg.version,
-    organization: null, // reserved for #5
+    organization: orgRow, // the data owner (#5)
     project: { id: req.project.id, name: req.project.name, dialect: req.project.dialect },
     kind: kind || 'all',
+    permission_filter: purpose || null,
     entry_count: rows.length,
     recording_count: masterCount + legacyCount,
     master_audio_count: masterCount,
     legacy_lossy_audio_count: legacyCount,
     derivative_count: derivCount,
     missing_files: missing,
-    note: 'Contains the current version of each recording. Superseded (re-recorded) master versions are retained in the application and are not included in this archive.',
+    consent: {
+      consented: census.consented ?? 0,
+      consent_unknown: census.consent_unknown ?? 0,
+      revoked: census.revoked ?? 0,
+      excluded_by_purpose_filter: purpose ? (census.total ?? 0) - (masterCount + legacyCount) : 0,
+    },
+    note: purpose
+      ? `Purpose-filtered export ("${purpose}"): only recordings whose consent snapshot explicitly allows this use are included; consent-unknown and revoked recordings are excluded. Permission is never inferred from membership or visibility.`
+      : 'Contains the current version of each recording. Superseded (re-recorded) master versions are retained in the application and are not included in this archive.',
   };
   const manifestStr = JSON.stringify(manifest, null, 2);
   const readme = [
@@ -1782,16 +1999,36 @@ api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => 
     `${missing ? `NOTE: ${missing} referenced file(s) were missing on the server and were omitted.` : ''}`,
   ].join('\n');
 
+  // permissions.json: the consent basis of every included recording plus the
+  // audit trail of assignments/revocations for this project's recordings.
+  const auditRows = db
+    .prepare(
+      `SELECT cc.audio_id, cc.action, cc.profile_name, cc.note, u.name AS changed_by, cc.changed_at
+       FROM consent_changes cc
+       JOIN audio_files a ON a.id = cc.audio_id
+       JOIN entries e ON e.id = a.entry_id
+       JOIN users u ON u.id = cc.changed_by
+       WHERE e.project_id = ? ORDER BY cc.changed_at, cc.id`
+    )
+    .all(req.project.id);
+  const permissionsJson = JSON.stringify({
+    purpose_filter: purpose || null,
+    flags: CONSENT_FLAGS,
+    recordings: recordingsJson.map((r) => ({ file: r.file, consent: r.consent })),
+    audit: auditRows,
+  }, null, 2);
+
   // Text files also go into checksums.sha256 (which necessarily can't list itself).
   for (const [name, content] of [
     ['manifest.json', manifestStr], ['README.txt', readme], ['entries.csv', entriesCsv],
     ['entries.json', entriesJson], ['recordings.json', recordingsJsonStr], ['speakers.json', speakersJson],
+    ['permissions.json', permissionsJson],
   ]) checksumLines.push(`${sha256Hex(content)}  ${name}`);
   const checksumsStr = checksumLines.join('\n') + '\n';
 
   // --- stream the ZIP ---
   const stamp = new Date().toISOString().slice(0, 10);
-  const base = `${req.project.name.replace(/[^\w-]+/g, '_')}_${stamp}${kind ? `_${kind}s` : ''}_archive`;
+  const base = `${req.project.name.replace(/[^\w-]+/g, '_')}_${stamp}${kind ? `_${kind}s` : ''}${purpose ? `_${purpose}` : ''}_archive`;
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('Content-Disposition', `attachment; filename="${base}.zip"`);
   const archive = archiver('zip', { store: true }); // audio is incompressible; STORE keeps CPU low
@@ -1804,6 +2041,7 @@ api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => 
   archive.append(entriesJson, { name: 'entries.json' });
   archive.append(recordingsJsonStr, { name: 'recordings.json' });
   archive.append(speakersJson, { name: 'speakers.json' });
+  archive.append(permissionsJson, { name: 'permissions.json' });
   archive.append(checksumsStr, { name: 'checksums.sha256' });
   for (const f of files) archive.file(f.abs, { name: f.name });
   archive.finalize();

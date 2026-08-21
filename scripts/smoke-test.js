@@ -985,5 +985,82 @@ check('org owner deletes the org project (cleanup)', r.status === 200, JSON.stri
 r = await sa.req('DELETE', `/api/orgs/${orgId}`);
 check('empty org deleted (cleanup restores single-org state)', r.status === 200, JSON.stringify(r.data));
 
+// --- consent & permitted use (#6) ---
+// STORE-mode zips carry text files uncompressed, so manifest fields are directly
+// searchable in the response buffer — deep assertions without unzipping.
+const zipHas = (z, s) => z.buf.toString('latin1').includes(s);
+const mainOrgId = (await sa.req('GET', '/api/me')).data.orgs[0].id;
+r = await sa.req('POST', `/api/orgs/${mainOrgId}/consent-profiles`, {
+  name: `Edu+ASR ${Date.now()}`, allow_language_learning: true, allow_asr_training: true, allow_research: true,
+});
+check('org admin creates a consent profile', r.status === 201 && r.data.allow_asr_training === 1 &&
+  r.data.allow_tts_training === 0, JSON.stringify(r.data));
+const profId = r.data.id;
+const profName = r.data.name;
+
+const cpName = `Consent Test ${Date.now()}`;
+r = await sa.req('POST', '/api/projects', { name: cpName });
+const cpId = r.data.id;
+r = await sa.req('POST', '/api/entries', { project_id: cpId, dene_text: 'tł’ok’ale', english_text: 'grass' });
+const cpEntry = r.data.id;
+
+// (2)+(5) consent-unknown: in the owner archive, excluded from purpose exports —
+// permission is never inferred from access or visibility.
+fd = new FormData(); fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'unknown.wav'); fd.append('language', 'dene');
+const r1 = (await sa.req('POST', `/api/entries/${cpEntry}/audio`, fd, true)).data;
+check('recording without a default profile is consent-unknown', r1.consent_profile_name === null, JSON.stringify(r1.consent_profile_name));
+let zFull = await sa.raw('GET', `/api/projects/${cpId}/export-bundle`);
+check('owner archive includes the consent-unknown recording', zipHas(zFull, '"recording_count": 1') && zipHas(zFull, '"consent_unknown": 1'));
+let zAsr = await sa.raw('GET', `/api/projects/${cpId}/export-bundle?purpose=asr`);
+check('purpose export excludes consent-unknown (no inference)', zipHas(zAsr, '"recording_count": 0') && zipHas(zAsr, '"permission_filter": "asr"'), zAsr.status);
+r = await sa.raw('GET', `/api/projects/${cpId}/export-bundle?purpose=nonsense`);
+check('unknown purpose rejected', r.status === 400);
+
+// (1) default profile stamps a snapshot on new recordings; later profile edits
+// don't rewrite it.
+r = await sa.req('PUT', `/api/projects/${cpId}/consent-default`, { profile_id: profId });
+check('project default consent profile set', r.status === 200);
+r = await sa.req('POST', '/api/entries', { project_id: cpId, dene_text: 'sas', english_text: 'bear' });
+const cpEntry2 = r.data.id;
+fd = new FormData(); fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'stamped.wav'); fd.append('language', 'dene');
+const r2 = (await sa.req('POST', `/api/entries/${cpEntry2}/audio`, fd, true)).data;
+check('new recording carries the consent snapshot', r2.consent_profile_name === profName &&
+  r2.allow_asr_training === 1 && r2.allow_tts_training === 0 && r2.consent_method === 'project_default_profile',
+  JSON.stringify({ p: r2.consent_profile_name, asr: r2.allow_asr_training }));
+await sa.req('PATCH', `/api/consent-profiles/${profId}`, { allow_asr_training: false, allow_tts_training: true });
+r = await sa.req('GET', `/api/entries/${cpEntry2}`);
+const snap = r.data.audio.find((a) => a.id === r2.id);
+check('editing the profile does not rewrite the snapshot', snap.allow_asr_training === 1 && snap.allow_tts_training === 0,
+  JSON.stringify({ asr: snap.allow_asr_training, tts: snap.allow_tts_training }));
+await sa.req('PATCH', `/api/consent-profiles/${profId}`, { allow_asr_training: true, allow_tts_training: false });
+
+// (3) bulk-assign stamps only consent-unknown rows, audited; purpose export
+// then includes them.
+r = await sa.req('POST', `/api/projects/${cpId}/consent/assign`, { profile_id: profId });
+check('bulk assign stamps the consent-unknown recording only', r.status === 200 && r.data.assigned === 1, JSON.stringify(r.data));
+zAsr = await sa.raw('GET', `/api/projects/${cpId}/export-bundle?purpose=asr`);
+check('purpose export now includes both consented recordings', zipHas(zAsr, '"recording_count": 2'));
+check('audit trail is in permissions.json', zipHas(zAsr, '"action": "assign"'));
+
+// (4) revocation: org-admin only, audited; drops from purpose exports, stays in
+// the owner archive flagged.
+await sa.req('POST', `/api/projects/${cpId}/members`, { email: memberEmail, role: 'member' });
+r = await member.req('POST', `/api/audio/${r1.id}/revoke`, { note: 'nope' });
+check('project member cannot revoke consent', r.status === 403);
+r = await sa.req('POST', `/api/audio/${r1.id}/revoke`, { note: 'speaker withdrew consent' });
+check('org admin revokes a recording', r.status === 200 && !!r.data.revoked_at, JSON.stringify(r.data.revoked_at));
+r = await sa.req('POST', `/api/audio/${r1.id}/revoke`, {});
+check('double revoke rejected', r.status === 400);
+zAsr = await sa.raw('GET', `/api/projects/${cpId}/export-bundle?purpose=asr`);
+check('revoked recording drops out of purpose exports', zipHas(zAsr, '"recording_count": 1') && zipHas(zAsr, '"revoked": 1'));
+zFull = await sa.raw('GET', `/api/projects/${cpId}/export-bundle`);
+check('owner archive keeps the revoked recording, flagged + audited',
+  zipHas(zFull, '"recording_count": 2') && zipHas(zFull, '"action": "revoke"'));
+
+// cleanup: project then profile (suite stays repeatable; snapshots die with the project)
+await sa.req('DELETE', `/api/projects/${cpId}`, { confirm_name: cpName });
+r = await sa.req('DELETE', `/api/consent-profiles/${profId}`);
+check('consent profile deleted (cleanup)', r.status === 200);
+
 console.log(failures ? `\n${failures} FAILURES` : '\nAll checks passed.');
 process.exit(failures ? 1 : 0);
