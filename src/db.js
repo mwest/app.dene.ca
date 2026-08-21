@@ -510,6 +510,20 @@ db.transaction(() => {
   }
 })();
 
+// Repair: recording ledger rows written before billWorkItem stamped entry_id
+// have entry_id NULL, which left the work-log "Detail" column blank. Recover it
+// from the surviving work_item or audio row. Idempotent; runs as boot-time
+// reconciliation (rows whose work item AND audio are both gone stay NULL and
+// the UI shows a placeholder).
+db.exec(`UPDATE work_log SET entry_id =
+           (SELECT wi.entry_id FROM work_items wi WHERE wi.id = work_log.work_item_id)
+         WHERE entry_id IS NULL AND work_item_id IS NOT NULL
+           AND EXISTS (SELECT 1 FROM work_items wi WHERE wi.id = work_log.work_item_id)`);
+db.exec(`UPDATE work_log SET entry_id =
+           (SELECT a.entry_id FROM audio_files a WHERE a.id = work_log.audio_id)
+         WHERE entry_id IS NULL AND audio_id IS NOT NULL
+           AND EXISTS (SELECT 1 FROM audio_files a WHERE a.id = work_log.audio_id)`);
+
 // Migration (hardening #10): session tokens are now stored hashed. Existing
 // rows hold raw tokens that would no longer resolve — clear them once (everyone
 // signs in again), gated by PRAGMA user_version so this never re-runs.

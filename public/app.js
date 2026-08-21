@@ -762,9 +762,11 @@ async function renderCompensation() {
 // Work-log "Detail" cell: the entry's Dene word (or English if it's blank),
 // linking to the entry's edit form; falls back to the note for adjustments.
 function workEntryCell(w) {
-  if (!w.entry_id) return esc(w.note ?? '');
+  // No entry reference (orphaned legacy row or a project-less adjustment):
+  // show the note, or a placeholder — never a blank cell.
+  if (!w.entry_id) return esc(w.note || '') || '<span style="color:var(--muted)">—</span>';
   const label = w.dene_text || w.english_text || `entry #${w.entry_id}`;
-  return `<a href="#/entries/${w.entry_id}">${esc(label)}</a>`;
+  return `<a href="#/entries/${w.entry_id}">${esc(label)}</a>${w.note ? ` <span style="color:var(--muted)">· ${esc(w.note)}</span>` : ''}`;
 }
 
 async function renderCompensationDetail(id) {
@@ -971,12 +973,11 @@ async function renderEntries(kind = 'word') {
         <option value="yes" ${listState.has_audio === 'yes' ? 'selected' : ''}>Has audio</option>
         <option value="no" ${listState.has_audio === 'no' ? 'selected' : ''}>No audio</option>
       </select>
-      ${isPhrase ? `
       <select id="f-incomplete">
         <option value="">Translation: any</option>
         <option value="yes" ${listState.incomplete === 'yes' ? 'selected' : ''}>Needs translation</option>
         <option value="done" ${listState.incomplete === 'done' ? 'selected' : ''}>Complete</option>
-      </select>` : ''}
+      </select>
       <select id="f-contributor"><option value="">All contributors</option></select>
       <select id="f-status">
         <option value="">Status: any</option>
@@ -1044,7 +1045,7 @@ async function loadEntryList() {
   }
 
   listEl.innerHTML = data.entries.map((e) => {
-    const incomplete = e.kind === 'phrase' && (!e.dene_text || !e.english_text);
+    const incomplete = !e.dene_text || !e.english_text;
     return `
     <a class="entry-row" href="#/entries/${e.id}">
       <div class="dene">${esc(e.dene_text) || '<span class="placeholder">— no Dene yet —</span>'}</div>
@@ -1085,9 +1086,8 @@ function renderNewEntry(kind = 'word') {
   if (!projects.length) { location.hash = backHref; return; }
   const ap = activeProject();
 
-  // Words require both sides; phrases need at least one (the other can be filled
-  // in later — it'll be flagged as needing translation).
-  const req = isPhrase ? '' : 'required';
+  // Every entry — word or phrase — needs at least one side; the other can be
+  // filled in later (the entry is flagged as needing translation).
   view.innerHTML = `
     <div class="page-head">
       <h1>New ${isPhrase ? 'phrase' : 'entry'}</h1>
@@ -1095,11 +1095,11 @@ function renderNewEntry(kind = 'word') {
     </div>
     <div class="card">
       <form id="entry-form">
-        ${isPhrase ? '<p class="form-hint">Enter a Dene phrase, an English meaning, or both. If you enter only one, it will be queued for translation.</p>' : ''}
+        <p class="form-hint">Enter the Dene ${isPhrase ? 'phrase' : 'word'}, the English, or both. If you enter only one, it will be queued for translation.</p>
         <label class="field"><span>${isPhrase ? 'Dene phrase' : 'Dene text'}</span>
-          <input type="text" name="dene_text" id="dene-input" class="dene" ${req} lang="den" spellcheck="false"></label>
+          <input type="text" name="dene_text" id="dene-input" class="dene" lang="den" spellcheck="false"></label>
         <label class="field"><span>${isPhrase ? 'English meaning' : 'English text'}</span>
-          <input type="text" name="english_text" ${req}></label>
+          <input type="text" name="english_text"></label>
         <div class="form-row">
           <label class="field"><span>Category (optional)</span>
             <input type="text" name="category" placeholder="e.g. greetings, animals, weather"></label>
@@ -1136,7 +1136,7 @@ function renderNewEntry(kind = 'word') {
           notes: f.notes.value,
         },
       });
-      toast(`${isPhrase ? 'Phrase' : 'Entry'} created${isPhrase && (!entry.dene_text || !entry.english_text) ? ' — queued for translation' : ' — you can add audio now'}`);
+      toast(`${isPhrase ? 'Phrase' : 'Entry'} created${!entry.dene_text || !entry.english_text ? ' — queued for translation' : ' — you can add audio now'}`);
       location.hash = `#/entries/${entry.id}`;
     } catch (err) { showFormError(f, err.message); }
   });
@@ -1153,7 +1153,7 @@ async function renderEntryDetail(id) {
   catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
 
   const isPhrase = entry.kind === 'phrase';
-  const incomplete = isPhrase && (!entry.dene_text || !entry.english_text);
+  const incomplete = !entry.dene_text || !entry.english_text;
   // Translators reach entries from their work log and can't see the dictionary
   // tabs, so send them back there instead.
   const fromWorkLog = isTranslator();
@@ -1233,9 +1233,9 @@ async function renderEntryDetail(id) {
         </div>
         <div class="entry-texts">
           <label class="field"><span>${isPhrase ? 'Dene phrase' : 'Dene text'}</span>
-            <textarea name="dene_text" id="dene-input" class="dene" ${isPhrase ? '' : 'required'} lang="den" spellcheck="false" ${ro ? 'readonly' : ''}>${esc(entry.dene_text)}</textarea></label>
+            <textarea name="dene_text" id="dene-input" class="dene" lang="den" spellcheck="false" ${ro ? 'readonly' : ''}>${esc(entry.dene_text)}</textarea></label>
           <label class="field"><span>${isPhrase ? 'English meaning' : 'English text'}</span>
-            <textarea name="english_text" ${isPhrase ? '' : 'required'} ${ro ? 'readonly' : ''}>${esc(entry.english_text)}</textarea></label>
+            <textarea name="english_text" ${ro ? 'readonly' : ''}>${esc(entry.english_text)}</textarea></label>
         </div>
         <div class="form-row">
           <label class="field"><span>Category</span>
@@ -1558,7 +1558,7 @@ async function renderTranslatorDashboard() {
   try {
     const [rec, trans, c] = await Promise.all([
       api(`/entries?project_id=${p.id}&needs_my_audio=dene&complete=yes&limit=1`),
-      api(`/entries?project_id=${p.id}&kind=phrase&complete=no&limit=1`),
+      api(`/entries?project_id=${p.id}&complete=no&limit=1`),
       api('/me/compensation'),
     ]);
     recTotal = rec.total;
@@ -1571,7 +1571,7 @@ async function renderTranslatorDashboard() {
       <h1>Welcome, ${esc(state.me.user.name)}</h1>
       <p class="translator-project">${esc(p.name)}${p.dialect ? ` — ${esc(p.dialect)}` : ''}</p>
       ${transTotal > 0 ? `
-        <p class="queue-count">${transTotal} ${transTotal === 1 ? 'phrase needs' : 'phrases need'} translation.</p>
+        <p class="queue-count">${transTotal} ${transTotal === 1 ? 'entry needs' : 'entries need'} translation.</p>
         <button class="big-action" id="start-translate">✎ Start translations session</button>` : ''}
       <p class="queue-count">${recTotal === 0
         ? 'Every entry has a recording — check back later.'
@@ -1904,7 +1904,7 @@ function renderTranslateDone() {
   view.innerHTML = `
     <div class="translator-home">
       <h1>All done 🎉</h1>
-      <p class="queue-count">Every phrase in this list has a translation. Mahsi cho!</p>
+      <p class="queue-count">Every entry in this list has a translation. Mahsi cho!</p>
       <div class="rec-actions">
         <button class="secondary" id="back-dash">Back to dashboard</button>
         <button id="check-more">Check for more</button>
