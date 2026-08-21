@@ -1334,6 +1334,14 @@ async function renderEntryDetail(id) {
               </div>`).join('')
           : '<div class="empty small">No previous versions — this is the first recording.</div>';
       } catch (err) { box.innerHTML = `<div class="empty small">${esc(err.message)}</div>`; }
+    } else if (action === 'revoke') {
+      const note = prompt('Revoke consent on this recording? It stays in the archive but is excluded from purpose-filtered exports and public use. Optional note (e.g. who withdrew consent):');
+      if (note === null) return;
+      try {
+        await api(`/audio/${audioId}/revoke`, { method: 'POST', body: { note } });
+        toast('Consent revoked');
+        renderEntryDetail(entry.id);
+      } catch (err) { toast(err.message, true); }
     } else if (action === 'edit-meta') {
       const item = btn.closest('.audio-item');
       const speaker = prompt('Speaker name / ID:', item.dataset.speaker || '');
@@ -1471,13 +1479,20 @@ function setupRecorder(entry) {
   };
 }
 
+// Consent badge for a recording (#6): revoked > profile name > consent-unknown.
+function consentBadge(a) {
+  if (a.revoked_at) return '<span class="badge" style="background:var(--danger);color:#fff" title="Consent revoked — excluded from purpose exports and public use">Revoked</span>';
+  if (a.consent_profile_name) return `<span class="badge" title="Consent profile snapshot">${esc(a.consent_profile_name)}</span>`;
+  return '<span class="badge" style="opacity:0.65" title="No consent recorded — excluded from purpose-filtered exports until assigned">Consent unknown</span>';
+}
+
 function audioItemHtml(a, entry) {
   const mine = a.uploaded_by === state.me.user.id;
   const canManage = mine || entry.role === 'admin';
   return `
     <div class="audio-item" data-speaker="${esc(a.speaker ?? '')}" data-notes="${esc(a.recording_notes ?? '')}">
       <div class="audio-item-head">
-        <span class="fname"><span class="badge ${a.language === 'english' ? '' : 'audio'}">${a.language === 'english' ? 'English' : 'Dene'}</span> ${esc(a.original_name)}</span>
+        <span class="fname"><span class="badge ${a.language === 'english' ? '' : 'audio'}">${a.language === 'english' ? 'English' : 'Dene'}</span> ${esc(a.original_name)} ${consentBadge(a)}</span>
         <span style="color:var(--muted);font-size:0.85rem">
           ${fmtDuration(a.duration_seconds)} · ${(a.size_bytes / 1024 / 1024).toFixed(1)} MB
           · uploaded by ${esc(a.uploaded_by_name)} on ${fmtDate(a.created_at)}
@@ -1494,6 +1509,7 @@ function audioItemHtml(a, entry) {
         <a class="btn ghost small" href="/api/audio/${a.id}/master" title="Download the lossless archival master">⬇ Master</a>
         <button type="button" class="ghost small" data-action="history" data-id="${a.id}">Previous versions</button>
         <button type="button" class="ghost small" data-action="edit-meta" data-id="${a.id}">Edit details</button>
+        ${isOrgAdmin() && !a.revoked_at ? `<button type="button" class="danger small" data-action="revoke" data-id="${a.id}">Revoke consent</button>` : ''}
         <button type="button" class="danger small" data-action="delete" data-id="${a.id}">Delete</button>
       </div>
       <div class="audio-versions" id="versions-${a.id}" hidden></div>` : ''}
@@ -1966,8 +1982,56 @@ async function renderDashboard() {
     if (action === 'members') location.hash = `#/projects/${pid}/members`;
     if (action === 'edit') showEditProjectModal(pid);
     if (action === 'import') showImportModal(pid, btn.dataset.name);
+    if (action === 'consent') showConsentModal(pid);
     if (action === 'delete') showDeleteProjectModal(pid, btn.dataset.name);
   };
+}
+
+// Consent controls for a project (#6): pick the default profile stamped onto new
+// recordings, and bulk-assign a profile to existing consent-unknown recordings.
+async function showConsentModal(projectId) {
+  const p = state.me.projects.find((x) => x.id === Number(projectId));
+  if (!p) return;
+  let profiles = [];
+  try { profiles = (await api(`/orgs/${p.organization_id}/consent-profiles`)).profiles; }
+  catch (err) { toast(err.message, true); return; }
+  const opts = profiles.map((pr) =>
+    `<option value="${pr.id}" ${p.default_consent_profile_id === pr.id ? 'selected' : ''}>${esc(pr.name)}</option>`).join('');
+  openModal(`
+    <h2>Consent — ${esc(p.name)}</h2>
+    <p style="color:var(--muted);font-size:0.9rem;max-width:52ch">New recordings are stamped with the
+      default profile below. Existing recordings without consent stay
+      <b>consent-unknown</b> (excluded from purpose-filtered exports) until assigned.</p>
+    ${profiles.length ? `
+    <form id="consent-default-form">
+      <label class="field"><span>Default profile for new recordings</span>
+        <select name="profile_id"><option value="">— none (consent-unknown) —</option>${opts}</select></label>
+      <div class="rec-actions">
+        <button type="submit">Save default</button>
+        <button type="button" class="secondary" id="bulk-assign-btn">Assign to existing consent-unknown recordings</button>
+      </div>
+    </form>` : `<p>No consent profiles yet — create one on the <a href="#/org">Organization</a> page first.</p>`}
+  `);
+  $('#consent-default-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const v = e.target.profile_id.value;
+    try {
+      await api(`/projects/${projectId}/consent-default`, { method: 'PUT', body: { profile_id: v ? Number(v) : null } });
+      toast('Default consent profile saved');
+      closeModal();
+      loadMe().then(renderDashboard);
+    } catch (err) { toast(err.message, true); }
+  });
+  $('#bulk-assign-btn')?.addEventListener('click', async (e) => {
+    const sel = $('#consent-default-form').profile_id.value;
+    if (!sel) { toast('Pick a profile to assign', true); return; }
+    const prof = profiles.find((x) => x.id === Number(sel));
+    if (!confirm(`Stamp "${prof.name}" onto every consent-unknown recording in ${p.name}? Recordings that already have consent are untouched. This is recorded in the audit trail.`)) return;
+    try {
+      const r = await api(`/projects/${projectId}/consent/assign`, { method: 'POST', body: { profile_id: prof.id } });
+      toast(`Assigned to ${r.assigned} recording${r.assigned === 1 ? '' : 's'}`);
+    } catch (err) { toast(err.message, true); }
+  });
 }
 
 function showEditProjectModal(projectId) {
@@ -2109,6 +2173,7 @@ function projectCardHtml(p) {
         ${isOrgAdmin() ? `
           <button class="ghost small" data-proj-action="edit" data-id="${p.id}">Edit</button>
           <button class="ghost small" data-proj-action="import" data-id="${p.id}" data-name="${esc(p.name)}">Import CSV</button>
+          <button class="ghost small" data-proj-action="consent" data-id="${p.id}">Consent</button>
           <button class="danger small" data-proj-action="delete" data-id="${p.id}" data-name="${esc(p.name)}">Delete</button>` : ''}
       </div>
     </div>`;
@@ -2401,6 +2466,18 @@ async function renderOrganization() {
     }
   }
 
+  // Consent profiles per owned org (#6).
+  for (const s of sections) {
+    if (s.error) continue;
+    try { s.profiles = (await api(`/orgs/${s.org.id}/consent-profiles`)).profiles; }
+    catch { s.profiles = []; }
+  }
+
+  const FLAG_LABELS = {
+    allow_language_learning: 'Learning', allow_asr_training: 'ASR', allow_tts_training: 'TTS',
+    allow_translation_model_training: 'Translation AI', allow_research: 'Research',
+    allow_commercial_use: 'Commercial', allow_redistribution: 'Redistribution',
+  };
   const roleLabel = { owner_admin: 'Owner', admin: 'Org admin', member: 'Member' };
   view.innerHTML = `
     <div class="page-head"><h1>Organization</h1></div>
@@ -2432,18 +2509,46 @@ async function renderOrganization() {
             <option value="owner_admin">Owner</option>
           </select>
           <button type="submit">Add / set role</button>
+        </form>
+        <h3 style="margin:1.2rem 0 0.4rem">Consent profiles</h3>
+        <p style="color:var(--muted);font-size:0.85rem;max-width:60ch">Reusable bundles of permitted
+          uses. Recordings keep a snapshot of the profile at assignment time — editing or deleting a
+          profile never changes past consent.</p>
+        ${(sections.find((s) => s.org.id === org.id)?.profiles ?? []).map((p) => `
+          <div class="version-row">
+            <span><b>${esc(p.name)}</b> — ${Object.entries(FLAG_LABELS).filter(([f]) => p[f]).map(([, l]) => l).join(', ') || 'no uses permitted'}</span>
+            <button class="danger small" data-profile-delete="${p.id}">Delete</button>
+          </div>`).join('') || '<p style="color:var(--muted);font-size:0.85rem">No profiles yet.</p>'}
+        <form class="profile-add" data-org="${org.id}" style="margin-top:0.6rem">
+          <input type="text" name="name" required placeholder="profile name, e.g. Education + ASR" style="min-width:240px">
+          <div style="display:flex;gap:0.8rem;flex-wrap:wrap;margin:0.5rem 0">
+            ${Object.entries(FLAG_LABELS).map(([f, l]) =>
+              `<label style="font-size:0.85rem"><input type="checkbox" name="${f}"> ${l}</label>`).join('')}
+          </div>
+          <button type="submit">Create profile</button>
         </form>`}
       </div>`).join('')}`;
 
   view.onclick = async (e) => {
     const rm = e.target.closest('button[data-org-remove]');
-    if (!rm) return;
-    if (!confirm('Remove this person from the organization? Their project memberships are unaffected.')) return;
-    try {
-      await api(`/orgs/${rm.dataset.orgRemove}/members/${rm.dataset.user}`, { method: 'DELETE' });
-      toast('Removed from organization');
-      renderOrganization();
-    } catch (err) { toast(err.message, true); }
+    if (rm) {
+      if (!confirm('Remove this person from the organization? Their project memberships are unaffected.')) return;
+      try {
+        await api(`/orgs/${rm.dataset.orgRemove}/members/${rm.dataset.user}`, { method: 'DELETE' });
+        toast('Removed from organization');
+        renderOrganization();
+      } catch (err) { toast(err.message, true); }
+      return;
+    }
+    const pd = e.target.closest('button[data-profile-delete]');
+    if (pd) {
+      if (!confirm('Delete this consent profile? Recordings keep their snapshots; projects using it as a default fall back to consent-unknown.')) return;
+      try {
+        await api(`/consent-profiles/${pd.dataset.profileDelete}`, { method: 'DELETE' });
+        toast('Profile deleted');
+        renderOrganization();
+      } catch (err) { toast(err.message, true); }
+    }
   };
   for (const f of view.querySelectorAll('form.org-add')) {
     f.addEventListener('submit', async (e) => {
@@ -2454,6 +2559,18 @@ async function renderOrganization() {
           body: { email: f.email.value.trim(), role: f.role.value },
         });
         toast('Organization role saved');
+        renderOrganization();
+      } catch (err) { toast(err.message, true); }
+    });
+  }
+  for (const f of view.querySelectorAll('form.profile-add')) {
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const body = { name: f.name.value.trim() };
+      for (const cb of f.querySelectorAll('input[type=checkbox]')) body[cb.name] = cb.checked;
+      try {
+        await api(`/orgs/${f.dataset.org}/consent-profiles`, { method: 'POST', body });
+        toast('Consent profile created');
         renderOrganization();
       } catch (err) { toast(err.message, true); }
     });
