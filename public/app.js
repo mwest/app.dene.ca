@@ -2128,14 +2128,15 @@ function showImportModal(projectId, projectName) {
       A CSV with two text columns: Dene and English, plus an optional third
       <b>Category</b> column. A header row like <code>dene_text,english_text,category</code>
       (or "Dene Text","English Text","Category") is used if present; otherwise the
-      columns are taken in that order. Rows already in the project and duplicates
-      within the file are skipped, so re-importing the same file is safe.
-      Max 10,000 rows per file.</p>
+      columns are taken in that order. Every row with text in <b>either</b> column is
+      imported — one-sided rows are queued for translation. Rows already in the
+      project and duplicates within the file are skipped, so re-importing the same
+      file is safe. Max 10,000 rows per file.</p>
     <form id="import-form">
       <label class="field"><span>Import as</span>
         <select name="kind">
-          <option value="word">Dictionary words (both sides required)</option>
-          <option value="phrase">Phrases (one side may be blank)</option>
+          <option value="word">Dictionary words</option>
+          <option value="phrase">Phrases</option>
         </select></label>
       <label class="field"><span>CSV file</span>
         <input type="file" name="file" accept=".csv,.txt,text/csv" required></label>

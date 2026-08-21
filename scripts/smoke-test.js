@@ -585,9 +585,14 @@ const csvBody = [
 fd = new FormData();
 fd.append('file', new Blob(['﻿' + csvBody], { type: 'text/csv' }), 'phrasebook.csv');
 r = await sa.req('POST', `/api/projects/${projectId}/import`, fd, true);
-check('CSV import (header, quotes, BOM, CRLF)', r.status === 200 &&
-  r.data.imported === 3 && r.data.skipped_duplicates === 1 && r.data.skipped_invalid === 2,
+// One-sided rows now import (queued for translation) — only fully-empty rows are invalid.
+check('CSV import (header, quotes, BOM, CRLF; one-sided rows import)', r.status === 200 &&
+  r.data.imported === 5 && r.data.skipped_duplicates === 1 && r.data.skipped_invalid === 0,
   JSON.stringify(r.data));
+r = await sa.req('GET', `/api/entries?project_id=${projectId}&q=${encodeURIComponent('missing dene')}`);
+check('one-sided imported row is queued for translation', r.status === 200 &&
+  r.data.entries[0]?.dene_text === '' && r.data.entries[0]?.english_text === 'missing dene',
+  JSON.stringify(r.data.entries?.[0]));
 
 r = await sa.req('GET', `/api/entries?project_id=${projectId}&q=${encodeURIComponent('sǫba')}`);
 check('imported entry searchable with diacritics intact', r.status === 200 && r.data.total === 1 &&
@@ -599,7 +604,7 @@ fd = new FormData();
 fd.append('file', new Blob([csvBody], { type: 'text/csv' }), 'phrasebook.csv');
 r = await sa.req('POST', `/api/projects/${projectId}/import`, fd, true);
 check('re-import is idempotent (all duplicates)', r.status === 200 &&
-  r.data.imported === 0 && r.data.skipped_duplicates === 4, JSON.stringify(r.data));
+  r.data.imported === 0 && r.data.skipped_duplicates === 6, JSON.stringify(r.data));
 
 // headerless two-column file
 fd = new FormData();
@@ -1036,7 +1041,7 @@ r = await sa.req('DELETE', `/api/projects/${projectId}`, { confirm_name: pname }
 // deleted_recordings counts ALL versions (current + superseded), so the member's
 // dene v1 + v2 both count here (#8b keeps superseded masters until project delete).
 check('superadmin deletes project (entries + all recording versions)', r.status === 200 &&
-  r.data.deleted_entries === 9 && r.data.deleted_recordings === 2, JSON.stringify(r.data));
+  r.data.deleted_entries === 11 && r.data.deleted_recordings === 2, JSON.stringify(r.data));
 
 r = await sa.req('GET', `/api/entries/${entryId}`);
 check('entries gone after project deletion', r.status === 404);
