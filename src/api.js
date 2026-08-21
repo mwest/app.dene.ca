@@ -1176,13 +1176,10 @@ api.post('/entries', (req, res) => {
   const kind = req.body?.kind === 'phrase' ? 'phrase' : 'word';
   const dene = dene_text?.trim() || '';
   const english = english_text?.trim() || '';
-  // Words need both sides; a phrase needs at least one (the missing side is
-  // stored as '' and the phrase is flagged incomplete until translated).
-  if (kind === 'phrase') {
-    if (!dene && !english) return bad(res, 'Enter a Dene phrase, an English meaning, or both');
-  } else if (!dene || !english) {
-    return bad(res, 'Both Dene text and English text are required');
-  }
+  // Any entry — word or phrase — needs at least one side. A one-sided entry is
+  // stored with '' for the missing side and flagged "needs translation": it goes
+  // into the translation queue and is held out of recording until completed.
+  if (!dene && !english) return bad(res, 'Enter Dene text, English text, or both');
   const info = db
     .prepare(
       `INSERT INTO entries (project_id, kind, dene_text, english_text, source_doc, notes, category, created_by, updated_by)
@@ -1213,16 +1210,11 @@ api.get('/entries/:id', loadEntry, (req, res) => {
 api.patch('/entries/:id', loadEntry, (req, res) => {
   if (!canEditEntry(req)) return bad(res, 'You can only edit your own entries', 403);
   const { dene_text, english_text, source_doc, notes, category, status } = req.body ?? {};
-  // Resolve the resulting two sides, then enforce the per-kind rule: words need
-  // both; phrases need at least one (an emptied side is stored as '').
+  // Resolve the resulting two sides; every entry must keep at least one (an
+  // emptied side is stored as '' and the entry returns to the translation queue).
   const nextDene = dene_text !== undefined ? dene_text.trim() : req.entry.dene_text;
   const nextEnglish = english_text !== undefined ? english_text.trim() : req.entry.english_text;
-  if (req.entry.kind === 'phrase') {
-    if (!nextDene && !nextEnglish) return bad(res, 'A phrase must keep a Dene phrase or an English meaning');
-  } else {
-    if (!nextDene) return bad(res, 'Dene text cannot be empty');
-    if (!nextEnglish) return bad(res, 'English text cannot be empty');
-  }
+  if (!nextDene && !nextEnglish) return bad(res, 'An entry must keep Dene text or English text');
   if (status !== undefined) {
     if (req.projectRole !== 'admin') return bad(res, 'Only project admins can change review status', 403);
     if (!['draft', 'reviewed', 'verified'].includes(status)) return bad(res, 'Invalid status');
@@ -1258,16 +1250,16 @@ api.delete('/entries/:id', loadEntry, (req, res) => {
   res.json({ ok: true });
 });
 
-// Fill in a phrase's missing side directly (members/admins; unbilled). Paid
+// Fill in an entry's missing side directly (members/admins; unbilled) — words
+// and phrases alike can be one-sided and queued for translation. Paid
 // translation flows through work items; translators use the translation session.
 api.post('/entries/:id/translate', loadEntry, rejectTranslators, (req, res) => {
-  if (req.entry.kind !== 'phrase') return bad(res, 'Only phrases can be translated here');
   const incomplete = req.entry.dene_text === '' || req.entry.english_text === '';
-  if (!incomplete && !canEditEntry(req)) return bad(res, 'This phrase is already complete', 403);
+  if (!incomplete && !canEditEntry(req)) return bad(res, 'This entry is already complete', 403);
   const { dene_text, english_text } = req.body ?? {};
   const nextDene = dene_text !== undefined ? String(dene_text).trim() : req.entry.dene_text;
   const nextEnglish = english_text !== undefined ? String(english_text).trim() : req.entry.english_text;
-  if (!nextDene && !nextEnglish) return bad(res, 'Enter a Dene phrase or an English meaning');
+  if (!nextDene && !nextEnglish) return bad(res, 'Enter Dene text or an English meaning');
   applyTranslation(req.entry, nextDene, nextEnglish, req.user.id);
   res.json(db.prepare(`${entrySelect} WHERE e.id = ?`).get(...entryParams(req.user), req.entry.id));
 });
@@ -1402,7 +1394,8 @@ api.post('/entries/:id/audio', loadEntry, rejectTranslators, audioUpload, async 
   if (!req.file) return bad(res, 'No audio file provided');
   const filePath = req.file.path;
   // Can't record an incomplete phrase — it must be translated first.
-  if (req.entry.kind === 'phrase' && (req.entry.dene_text === '' || req.entry.english_text === '')) {
+  // Any one-sided entry (word or phrase) must be translated before recording.
+  if (req.entry.dene_text === '' || req.entry.english_text === '') {
     fs.rm(filePath, { force: true }, () => {});
     return bad(res, 'Add the translation before recording this phrase');
   }
@@ -1700,7 +1693,7 @@ api.post('/projects/:id/work/claim', (req, res) => {
       candidates = db
         .prepare(
           `SELECT e.id FROM entries e
-           WHERE e.project_id = ? AND e.kind = 'phrase'
+           WHERE e.project_id = ?
              AND (e.dene_text = '' OR e.english_text = '')
              AND NOT EXISTS (SELECT 1 FROM work_items w WHERE w.entry_id = e.id
                                AND w.type = 'translation' AND w.status IN ('claimed', 'submitted'))

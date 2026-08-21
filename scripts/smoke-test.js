@@ -701,8 +701,29 @@ const phraseBoth = r.data?.id;
 r = await member.req('POST', '/api/entries', { project_id: projectId, kind: 'phrase' });
 check('phrase with neither side rejected', r.status === 400);
 
-r = await member.req('POST', '/api/entries', { project_id: projectId, dene_text: 'lonely', english_text: '' });
-check('word still requires both sides', r.status === 400);
+// UI fix: a one-sided WORD is now valid too — queued for translation, held out
+// of recording, offered by the translation claim, and completable.
+r = await member.req('POST', '/api/entries', { project_id: projectId, english_text: 'lonely' });
+check('one-sided word accepted (English only)', r.status === 201 && r.data.dene_text === '', JSON.stringify(r.data));
+const oneSidedWord = r.data.id;
+r = await member.req('GET', `/api/entries?project_id=${projectId}&complete=no`);
+check('one-sided word appears in the needs-translation filter', r.data.entries.some((e) => e.id === oneSidedWord));
+fd = new FormData();
+fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'w.wav');
+fd.append('language', 'dene');
+r = await member.req('POST', `/api/entries/${oneSidedWord}/audio`, fd, true);
+check('one-sided word cannot be recorded yet', r.status === 400, JSON.stringify(r.data));
+const wordClaim = (await translator.req('POST', `/api/projects/${projectId}/work/claim`, { type: 'translation', limit: 20 })).data;
+const wordItem = wordClaim.items.find((i) => i.entry.id === oneSidedWord);
+check('one-sided WORD is offered by the translation claim', !!wordItem, JSON.stringify(wordClaim.items.map((i) => i.entry.id)));
+r = await translator.req('POST', `/api/work/${wordItem.work_item_id}/submit`, { dene_text: 'ı̨łaghe', english_text: 'lonely' });
+check('translator completes the word via work item', r.status === 200, JSON.stringify(r.data));
+for (const i of wordClaim.items.filter((x) => x.work_item_id !== wordItem.work_item_id)) {
+  await translator.req('POST', `/api/work/${i.work_item_id}/release`);
+}
+await member.req('DELETE', `/api/entries/${oneSidedWord}`);
+r = await member.req('POST', '/api/entries', { project_id: projectId });
+check('an entry with neither side is still rejected', r.status === 400);
 
 r = await member.req('GET', `/api/entries?project_id=${projectId}&kind=phrase`);
 check('kind=phrase returns only phrases', r.status === 200 && r.data.total >= 3 &&
@@ -749,8 +770,10 @@ r = await member.req('POST', `/api/entries/${phraseDeneOnly}/translate`, { dene_
 check('member completes a phrase via translate (unbilled)', r.status === 200 &&
   r.data.dene_text === 'sǫǫ' && r.data.english_text === 'water (clean)', JSON.stringify(r.data));
 
-r = await member.req('POST', `/api/entries/${entryId}/translate`, { english_text: 'x' });
-check('translate rejected on a dictionary word', r.status === 400);
+// Words are translatable now, but a COMPLETE entry still can't be rewritten via
+// /translate by someone without edit rights (member2 doesn't own entryId).
+r = await member2.req('POST', `/api/entries/${entryId}/translate`, { english_text: 'x' });
+check('translate still rejects rewriting a complete entry', r.status === 403, JSON.stringify(r.data));
 
 // clean up the phrases (and their cascade-deleted audio) to keep counts stable
 for (const pid of [phraseDeneOnly, phraseEngOnly, phraseBoth]) {
