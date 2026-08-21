@@ -103,7 +103,13 @@ export function generateDerivative(audioId) {
     const rel = `derived/${a.uploaded_by}/${base}.mp3`;
     const outTmp = path.join(AUDIO_DIR, `${rel}.tmp`);
     const outFinal = path.join(AUDIO_DIR, rel);
-    const ff = spawn(FFMPEG, ['-nostdin', '-y', '-i', master, '-ac', '1', '-codec:a', 'libmp3lame', '-q:a', '5', outTmp], { stdio: 'ignore' });
+    // -f mp3 is required: the temp file ends in .tmp, and without an explicit
+    // format ffmpeg infers it from the extension and exits 1 ("unable to find a
+    // suitable output format"). stderr is piped so a failure logs its reason.
+    const ff = spawn(FFMPEG, ['-nostdin', '-y', '-i', master, '-ac', '1', '-codec:a', 'libmp3lame', '-q:a', '5', '-f', 'mp3', outTmp],
+                     { stdio: ['ignore', 'ignore', 'pipe'] });
+    let errTail = '';
+    ff.stderr.on('data', (d) => { errTail = (errTail + d.toString()).slice(-400); });
     ff.on('error', (e) => {
       console.error(`[audio] ffmpeg error for audio ${audioId}:`, e.message);
       fs.rm(outTmp, { force: true }, () => {});
@@ -111,7 +117,7 @@ export function generateDerivative(audioId) {
     });
     ff.on('exit', (code) => {
       if (code !== 0) {
-        console.error(`[audio] ffmpeg exited ${code} for audio ${audioId}`);
+        console.error(`[audio] ffmpeg exited ${code} for audio ${audioId}: ${errTail.trim().split('\n').pop() || 'no stderr'}`);
         fs.rm(outTmp, { force: true }, () => {});
         return resolve(false);
       }
