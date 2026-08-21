@@ -2286,11 +2286,9 @@ api.post('/projects/:id/import', requireOrgAdminOfProject, (req, res, next) => {
     catIdx = 2; // no header: assume Dene, English, [Category]
     dataRows = rows;
   }
-  // Words need both columns; phrases need at least one.
-  if (kind === 'word' && (deneIdx < 0 || engIdx < 0)) {
-    return bad(res, 'For a dictionary import, include both a Dene and an English column (header like "dene_text,english_text" or a two-column file).');
-  }
-  if (kind === 'phrase' && deneIdx < 0 && engIdx < 0) {
+  // Words and phrases alike need at least one recognizable column; a row with
+  // either side filled imports (the missing side is queued for translation).
+  if (deneIdx < 0 && engIdx < 0) {
     return bad(res, 'Include a Dene and/or English column (header like "dene_text,english_text").');
   }
   if (dataRows.length > MAX_IMPORT_ROWS) {
@@ -2319,9 +2317,9 @@ api.post('/projects/:id/import', requireOrgAdminOfProject, (req, res, next) => {
       const dene = (deneIdx >= 0 ? r[deneIdx] ?? '' : '').trim();
       const english = (engIdx >= 0 ? r[engIdx] ?? '' : '').trim();
       const category = catIdx >= 0 ? (r[catIdx] ?? '').trim() || null : null;
-      // Words require both sides; phrases require at least one.
-      const valid = kind === 'phrase' ? (dene || english) : (dene && english);
-      if (!valid) { skippedInvalid++; continue; }
+      // A row imports as long as EITHER side has text; the missing side is
+      // stored as '' and the entry is queued for translation.
+      if (!dene && !english) { skippedInvalid++; continue; }
       const key = JSON.stringify([dene, english]);
       if (seen.has(key)) { skippedDuplicates++; continue; }
       seen.add(key);

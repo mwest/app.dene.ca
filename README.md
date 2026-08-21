@@ -70,10 +70,10 @@ Phrases list by translation state with the "Needs translation / Complete"
 selector.
 
 **Import/export by kind.** CSV import (org admins) has an *Import as* selector —
-**Dictionary words** (both columns required) or **Phrases** (a row may fill only
-one side; recognises a `dene_text`/`english_text` header and accepts just one of
-them). Dedup is scoped per kind, so the same text can exist as both a word and a
-phrase. Each list tab has its own **Export CSV/JSON** (admins) that exports just
+**Dictionary words** or **Phrases**. Every row with text in either column imports
+(one-sided rows are queued for translation); it recognises a
+`dene_text`/`english_text` header and accepts just one of them. Dedup is scoped
+per kind, so the same text can exist as both a word and a phrase. Each list tab has its own **Export CSV/JSON** (admins) that exports just
 that kind (`?kind=word|phrase`); the project card's export still produces the
 full project, with a `kind` column distinguishing words from phrases.
 
