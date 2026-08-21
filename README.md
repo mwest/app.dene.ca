@@ -12,8 +12,8 @@ CSV/JSON export for STT/TTS training pipelines.
 - **Node.js 20+** (tested on 22), Express 5
 - **SQLite** (better-sqlite3) — single file at `data/dene.db`, WAL mode
 - Audio files stored on disk at `data/audio/<userID>/`, duration extracted with `music-metadata`
-- In-browser recording: microphone PCM is encoded to MP3 client-side with `lamejs`
-  (vendored at `public/vendor/lame.min.js`), so recorded clips are real `.mp3` files
+- In-browser recording: microphone PCM is saved as a lossless 16-bit WAV master;
+  the server generates a mono MP3 playback derivative with ffmpeg (#8b)
 - No-build vanilla JS frontend in `public/`
 - Everything self-hostable — no cloud services required (relevant to the OCAP / data
   sovereignty open question in the PRD)
@@ -28,14 +28,15 @@ npm start          # http://localhost:3000  (set PORT to change)
 
 Sign in as the superadmin, create a project from the **Dashboard**, then add members from
 the project card → **Members** (existing accounts are added by email; new accounts need a
-name and temporary password). Only the superadmin can create projects and assign project
+name and temporary password). Organization admins create projects and assign project
 admins; project admins manage their own project's members. There is no public signup.
 
 ## Roles
 
 | Role | Powers |
 |---|---|
-| Superadmin | Everything, across all projects; creates projects and project admins |
+| Superadmin | Platform only: accounts, translation-service requests, provisioning organizations. **No corpus access** without an org/project role |
+| Org owner / org admin | Full authority over their organization's projects: create/edit/delete projects, assign project admins, compensation, exports |
 | Project admin | Manage members, review/verify entries, export, edit any entry — in their project only |
 | Member | Create entries, edit/delete their own entries, upload audio, search within their projects |
 | Translator | Recording and translating only — a stripped-down app with a recording session (entries without audio) and a translation session (incomplete phrases). Can complete a phrase's missing side but cannot otherwise create or edit entries |
@@ -68,7 +69,7 @@ out of the queue and can't be recorded until it's translated). Filter the
 Phrases list by translation state with the "Needs translation / Complete"
 selector.
 
-**Import/export by kind.** CSV import (superadmin) has an *Import as* selector —
+**Import/export by kind.** CSV import (org admins) has an *Import as* selector —
 **Dictionary words** (both columns required) or **Phrases** (a row may fill only
 one side; recognises a `dene_text`/`english_text` header and accepts just one of
 them). Dedup is scoped per kind, so the same text can exist as both a word and a
@@ -79,13 +80,13 @@ full project, with a `kind` column distinguishing words from phrases.
 ## Recording audio
 
 Each entry shows two recording slots per user: **Dene** and **English**. Click record,
-speak, click **Stop & save** — the clip is encoded to MP3 in the browser, tagged with its
-language and the speaker, and attached automatically. Each user has at most **one
-recording per language per entry** (enforced by a unique index); re-recording or
-re-uploading the same language replaces the previous clip. Recordings are **visible to
-the whole project** — every member can see and play all recordings on entries in their
-projects; editing or deleting a recording is still restricted to its uploader, project
-admins, and superadmins.
+speak, click **Stop & save** — the clip is captured as a lossless WAV master, tagged with
+its language and the speaker, and attached automatically. Each user has at most **one
+current recording per language per entry**; re-recording or re-uploading the same
+language creates a **new version** and keeps the previous master in version history
+(never destroyed). Recordings are **visible to the whole project** — every member can
+see and play all recordings on entries in their projects; editing or deleting a
+recording is restricted to its uploader and project admins.
 Uploading existing files (WAV/MP3/M4A) is still available under
 "Upload an audio file instead". Microphone access requires a secure context:
 `localhost` works out of the box; a LAN/production deployment needs HTTPS.
@@ -104,7 +105,7 @@ never executes on the app origin.
 
 ## Compensation
 
-Optional tracking of translator pay (superadmin-only, under the **Compensation**
+Optional tracking of translator pay (organization admins, under the **Compensation**
 tab). Each translator has flat **per-project rates** — one for recording, one for
 translation — that can change at any time. As translators record clips and complete
 phrase translations, each billable action is logged once into an **append-only ledger**
@@ -115,7 +116,7 @@ negative, with a note).
 
 Balances **aggregate per translator** across all their projects:
 `balance = sum(work) − sum(payments)`. **Payments are recorded, not moved** — the app
-never touches money; the superadmin logs payments made offline (e-transfer, cheque, …)
+never touches money; an org admin logs payments made offline (e-transfer, cheque, …)
 for bookkeeping. Translators see their own running *earned / paid / balance* on their
 dashboard. All amounts are stored as integer cents (CAD). Rate changes are kept in an
 audit table.
