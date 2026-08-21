@@ -99,15 +99,24 @@ function setActiveProject(id) {
   localStorage.setItem('activeProjectId', state.activeProjectId);
 }
 
+// Project authority comes from the role the server computed (org admins get
+// role 'admin' on their org's projects) — being platform superadmin grants none.
 function isAdminOf(projectId) {
-  if (state.me?.user.is_superadmin) return true;
   const p = (state.me?.projects ?? []).find((x) => x.id === Number(projectId));
   return p?.role === 'admin';
 }
 
+// Org admin of at least one organization (drives compensation + org pages).
+function isOrgAdmin() {
+  return (state.me?.orgs ?? []).some((o) => o.role === 'owner_admin' || o.role === 'admin');
+}
+function isOrgOwner() {
+  return (state.me?.orgs ?? []).some((o) => o.role === 'owner_admin');
+}
+
 // Translators get a focused recording-only view of the app.
 function isTranslator() {
-  return !state.me?.user.is_superadmin && activeProject()?.role === 'translator';
+  return activeProject()?.role === 'translator';
 }
 
 // ---------------------------------------------------------------------------
@@ -296,7 +305,8 @@ function renderTopbar() {
   $('#user-menu-btn').textContent = `${state.me.user.name} ▾`;
   $('#nav-users').hidden = !state.me.user.is_superadmin;
   $('#nav-jobs').hidden = !state.me.user.is_superadmin;
-  $('#nav-compensation').hidden = !state.me.user.is_superadmin;
+  $('#nav-compensation').hidden = !isOrgAdmin();
+  $('#nav-org').hidden = !isOrgOwner();
   $('#topbar nav a[data-nav="entries"]').hidden = isTranslator();
   $('#topbar nav a[data-nav="phrases"]').hidden = isTranslator();
 
@@ -1915,7 +1925,7 @@ const TARGET_HOURS = 10; // hours of transcribed audio per dialect
 
 async function renderDashboard() {
   setActiveNav('dashboard');
-  const isSuper = state.me.user.is_superadmin;
+  const isSuper = isOrgAdmin(); // org admins get the rollup + project lifecycle
   view.innerHTML = `<div class="empty">Loading…</div>`;
 
   let data;
@@ -2096,7 +2106,7 @@ function projectCardHtml(p) {
           <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/projects/${p.id}/export?format=csv">Export CSV</a>
           <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/projects/${p.id}/export?format=json">Export JSON</a>
           <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/projects/${p.id}/export-bundle" title="Complete archive: entries + master audio + checksums">⬇ Full archive (ZIP)</a>` : ''}
-        ${state.me.user.is_superadmin ? `
+        ${isOrgAdmin() ? `
           <button class="ghost small" data-proj-action="edit" data-id="${p.id}">Edit</button>
           <button class="ghost small" data-proj-action="import" data-id="${p.id}" data-name="${esc(p.name)}">Import CSV</button>
           <button class="danger small" data-proj-action="delete" data-id="${p.id}" data-name="${esc(p.name)}">Delete</button>` : ''}
@@ -2172,7 +2182,7 @@ async function renderMembers(projectId) {
   catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
 
   const project = state.me.projects.find((p) => p.id === Number(projectId));
-  const isSuper = state.me.user.is_superadmin;
+  const isSuper = isOrgAdmin(); // only org admins assign/remove project admins
 
   view.innerHTML = `
     <div class="page-head">
@@ -2371,6 +2381,86 @@ async function renderUsers() {
 }
 
 // ---------------------------------------------------------------------------
+// Organization view (#5) — owner_admins manage who holds organization authority
+// over the corpus. Platform superadmins have no implicit presence here.
+// ---------------------------------------------------------------------------
+
+async function renderOrganization() {
+  setActiveNav('org');
+  view.innerHTML = `<div class="empty">Loading…</div>`;
+  const owned = (state.me.orgs ?? []).filter((o) => o.role === 'owner_admin');
+  if (!owned.length) { location.hash = '#/dashboard'; return; }
+
+  const sections = [];
+  for (const org of owned) {
+    try {
+      const d = await api(`/orgs/${org.id}/members`);
+      sections.push({ org, members: d.members });
+    } catch (err) {
+      sections.push({ org, error: err.message });
+    }
+  }
+
+  const roleLabel = { owner_admin: 'Owner', admin: 'Org admin', member: 'Member' };
+  view.innerHTML = `
+    <div class="page-head"><h1>Organization</h1></div>
+    <p style="color:var(--muted);max-width:60ch">Organization roles govern the corpus:
+      owners and org admins control projects, project admins, compensation, and exports.
+      Platform administration (accounts, service) is separate and grants no access here.</p>
+    ${sections.map(({ org, members, error }) => `
+      <div class="card">
+        <h2 style="margin-top:0">${esc(org.name)}</h2>
+        ${error ? `<p class="error-msg">${esc(error)}</p>` : `
+        <div class="table-wrap"><table>
+          <thead><tr><th>Name</th><th>Email</th><th>Role</th><th></th></tr></thead>
+          <tbody>
+            ${members.map((mb) => `
+              <tr>
+                <td>${esc(mb.name)}</td>
+                <td>${esc(mb.email)}</td>
+                <td>${roleLabel[mb.role] ?? mb.role}</td>
+                <td>${mb.id === state.me.user.id ? '' :
+                  `<button class="danger small" data-org-remove="${org.id}" data-user="${mb.id}">Remove</button>`}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table></div>
+        <form class="org-add" data-org="${org.id}" style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.8rem">
+          <input type="email" name="email" required placeholder="email of an existing account" style="flex:1;min-width:220px">
+          <select name="role">
+            <option value="member">Member</option>
+            <option value="admin">Org admin</option>
+            <option value="owner_admin">Owner</option>
+          </select>
+          <button type="submit">Add / set role</button>
+        </form>`}
+      </div>`).join('')}`;
+
+  view.onclick = async (e) => {
+    const rm = e.target.closest('button[data-org-remove]');
+    if (!rm) return;
+    if (!confirm('Remove this person from the organization? Their project memberships are unaffected.')) return;
+    try {
+      await api(`/orgs/${rm.dataset.orgRemove}/members/${rm.dataset.user}`, { method: 'DELETE' });
+      toast('Removed from organization');
+      renderOrganization();
+    } catch (err) { toast(err.message, true); }
+  };
+  for (const f of view.querySelectorAll('form.org-add')) {
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        await api(`/orgs/${f.dataset.org}/members`, {
+          method: 'POST',
+          body: { email: f.email.value.trim(), role: f.role.value },
+        });
+        toast('Organization role saved');
+        renderOrganization();
+      } catch (err) { toast(err.message, true); }
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Router & boot
 // ---------------------------------------------------------------------------
 
@@ -2415,8 +2505,9 @@ function route() {
   else if (hash === '#/users' && state.me.user.is_superadmin) renderUsers();
   else if (hash === '#/jobs' && state.me.user.is_superadmin) renderJobs();
   else if ((m = hash.match(/^#\/jobs\/(\d+)$/)) && state.me.user.is_superadmin) renderJobDetail(m[1]);
-  else if (hash === '#/compensation' && state.me.user.is_superadmin) renderCompensation();
-  else if ((m = hash.match(/^#\/compensation\/(\d+)$/)) && state.me.user.is_superadmin) renderCompensationDetail(m[1]);
+  else if (hash === '#/compensation' && isOrgAdmin()) renderCompensation();
+  else if ((m = hash.match(/^#\/compensation\/(\d+)$/)) && isOrgAdmin()) renderCompensationDetail(m[1]);
+  else if (hash === '#/org' && isOrgOwner()) renderOrganization();
   else if ((m = hash.match(/^#\/projects\/(\d+)\/members$/))) renderMembers(m[1]);
   else { location.hash = '#/entries'; }
 }

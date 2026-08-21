@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parseFile } from 'music-metadata';
 
-import db, { AUDIO_DIR, REQUESTS_DIR, roleIn, projectsFor, projectIdsFor } from './db.js';
+import db, { AUDIO_DIR, REQUESTS_DIR, roleIn, projectsFor, projectIdsFor, orgRole, orgsFor } from './db.js';
 import { embed, toBlob, fromBlob, cosine, MODEL } from './embed.js';
 import { MASTERS_DIR, DERIVED_DIR, probeAudio, enqueueDerivative, sha256File } from './audio.js';
 import { createRequire } from 'node:module';
@@ -300,7 +300,7 @@ api.post('/requests/form/:token', loadRequestByToken, (req, res, next) => {
 api.use(requireAuth); // everything below requires a session
 
 api.get('/me', (req, res) => {
-  res.json({ user: req.user, projects: projectsFor(req.user) });
+  res.json({ user: req.user, projects: projectsFor(req.user), orgs: orgsFor(req.user) });
 });
 
 api.post('/me/password', (req, res) => {
@@ -327,6 +327,141 @@ api.post('/me/name', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Organizations (#5) — the explicit data owner. Platform administration
+// (is_superadmin) is provisioning and account support only; corpus authority
+// flows from organization roles.
+// ---------------------------------------------------------------------------
+
+const isOrgAdmin = (user, orgId) => ['owner_admin', 'admin'].includes(orgRole(user, orgId));
+
+/** Middleware: :id names a project; caller must be an admin of its OWNING ORG
+ *  (project-level admins manage members and review, not project lifecycle). */
+function requireOrgAdminOfProject(req, res, next) {
+  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(Number(req.params.id));
+  if (!project) return bad(res, 'Project not found', 404);
+  if (!project.organization_id || !isOrgAdmin(req.user, project.organization_id)) {
+    return bad(res, 'Organization admin access required', 403);
+  }
+  req.project = project;
+  next();
+}
+
+/** IDs of orgs where the caller holds admin authority. */
+const adminOrgIdsFor = (user) =>
+  orgsFor(user).filter((o) => o.role === 'owner_admin' || o.role === 'admin').map((o) => o.id);
+
+api.get('/orgs', (req, res) => {
+  res.json({ orgs: orgsFor(req.user) });
+});
+
+// Provisioning (platform): create an organization. The creator — or, if given,
+// an existing user named by owner_email — becomes its owner_admin.
+api.post('/orgs', requireSuperadmin, (req, res) => {
+  const name = String(req.body?.name ?? '').trim();
+  if (!name) return bad(res, 'Organization name is required');
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || null;
+  let owner = req.user;
+  if (req.body?.owner_email) {
+    owner = db.prepare('SELECT * FROM users WHERE email = ?').get(String(req.body.owner_email).trim());
+    if (!owner) return bad(res, 'No account with that owner email');
+  }
+  try {
+    const info = db.transaction(() => {
+      const i = db.prepare('INSERT INTO organizations (name, slug) VALUES (?, ?)').run(name, slug);
+      db.prepare('INSERT INTO organization_memberships (organization_id, user_id, role) VALUES (?, ?, ?)')
+        .run(i.lastInsertRowid, owner.id, 'owner_admin');
+      return i;
+    })();
+    res.status(201).json(db.prepare('SELECT * FROM organizations WHERE id = ?').get(info.lastInsertRowid));
+  } catch (e) {
+    if (String(e.message).includes('UNIQUE')) return bad(res, 'An organization with that name already exists');
+    throw e;
+  }
+});
+
+api.patch('/orgs/:id', (req, res) => {
+  const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
+  if (!org) return bad(res, 'Organization not found', 404);
+  if (orgRole(req.user, org.id) !== 'owner_admin') return bad(res, 'Organization owner access required', 403);
+  const name = String(req.body?.name ?? '').trim();
+  if (!name) return bad(res, 'Organization name is required');
+  db.prepare('UPDATE organizations SET name = ? WHERE id = ?').run(name, org.id);
+  res.json(db.prepare('SELECT * FROM organizations WHERE id = ?').get(org.id));
+});
+
+api.get('/orgs/:id/members', (req, res) => {
+  const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
+  if (!org) return bad(res, 'Organization not found', 404);
+  if (!isOrgAdmin(req.user, org.id)) return bad(res, 'Organization admin access required', 403);
+  const members = db
+    .prepare(
+      `SELECT u.id, u.email, u.name, om.role, om.created_at
+       FROM organization_memberships om JOIN users u ON u.id = om.user_id
+       WHERE om.organization_id = ? ORDER BY om.role, u.name`
+    )
+    .all(org.id);
+  res.json({ org: { id: org.id, name: org.name }, members });
+});
+
+// Add or change an org member (existing accounts only — account creation stays a
+// platform/user-management concern). Only owner_admins manage org roles.
+api.post('/orgs/:id/members', (req, res) => {
+  const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
+  if (!org) return bad(res, 'Organization not found', 404);
+  if (orgRole(req.user, org.id) !== 'owner_admin') return bad(res, 'Organization owner access required', 403);
+  const role = ['owner_admin', 'admin', 'member'].includes(req.body?.role) ? req.body.role : 'member';
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(String(req.body?.email ?? '').trim());
+  if (!user) return bad(res, 'No account with that email — create the account first');
+  // Never demote the last owner (including an owner demoting themselves).
+  const existing = db
+    .prepare('SELECT role FROM organization_memberships WHERE organization_id = ? AND user_id = ?')
+    .get(org.id, user.id);
+  if (existing?.role === 'owner_admin' && role !== 'owner_admin') {
+    const owners = db
+      .prepare(`SELECT COUNT(*) AS n FROM organization_memberships WHERE organization_id = ? AND role = 'owner_admin'`)
+      .get(org.id).n;
+    if (owners <= 1) return bad(res, 'An organization must keep at least one owner');
+  }
+  db.prepare(
+    `INSERT INTO organization_memberships (organization_id, user_id, role) VALUES (?, ?, ?)
+     ON CONFLICT(organization_id, user_id) DO UPDATE SET role = excluded.role`
+  ).run(org.id, user.id, role);
+  res.status(201).json({ ok: true, user_id: user.id, role });
+});
+
+// Delete an EMPTY organization (owns no projects). Owner-only; memberships
+// cascade. An org with projects must move or delete them first.
+api.delete('/orgs/:id', (req, res) => {
+  const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
+  if (!org) return bad(res, 'Organization not found', 404);
+  if (orgRole(req.user, org.id) !== 'owner_admin') return bad(res, 'Organization owner access required', 403);
+  if (db.prepare('SELECT 1 FROM projects WHERE organization_id = ? LIMIT 1').get(org.id)) {
+    return bad(res, 'This organization still owns projects — move or delete them first');
+  }
+  db.prepare('DELETE FROM organizations WHERE id = ?').run(org.id);
+  res.json({ ok: true });
+});
+
+api.delete('/orgs/:id/members/:userId', (req, res) => {
+  const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
+  if (!org) return bad(res, 'Organization not found', 404);
+  if (orgRole(req.user, org.id) !== 'owner_admin') return bad(res, 'Organization owner access required', 403);
+  const target = db
+    .prepare('SELECT * FROM organization_memberships WHERE organization_id = ? AND user_id = ?')
+    .get(org.id, req.params.userId);
+  if (!target) return bad(res, 'Not a member of this organization', 404);
+  if (target.role === 'owner_admin') {
+    const owners = db
+      .prepare(`SELECT COUNT(*) AS n FROM organization_memberships WHERE organization_id = ? AND role = 'owner_admin'`)
+      .get(org.id).n;
+    if (owners <= 1) return bad(res, 'An organization must keep at least one owner');
+  }
+  db.prepare('DELETE FROM organization_memberships WHERE organization_id = ? AND user_id = ?')
+    .run(org.id, req.params.userId);
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------------
 
@@ -347,13 +482,26 @@ api.get('/projects', (req, res) => {
   res.json({ projects });
 });
 
-api.post('/projects', requireSuperadmin, (req, res) => {
+// Create a project inside an organization the caller administers. With one org
+// (the common case) organization_id can be omitted and defaults to it.
+api.post('/projects', (req, res) => {
   const { name, dialect, description } = req.body ?? {};
   if (!name || !String(name).trim()) return bad(res, 'Project name is required');
+  const adminOrgs = adminOrgIdsFor(req.user);
+  let orgId = req.body?.organization_id ? Number(req.body.organization_id) : null;
+  if (orgId) {
+    if (!adminOrgs.includes(orgId)) return bad(res, 'Organization admin access required', 403);
+  } else if (adminOrgs.length === 1) {
+    orgId = adminOrgs[0];
+  } else if (adminOrgs.length === 0) {
+    return bad(res, 'Organization admin access required', 403);
+  } else {
+    return bad(res, 'You administer multiple organizations — specify organization_id');
+  }
   try {
     const info = db
-      .prepare('INSERT INTO projects (name, dialect, description) VALUES (?, ?, ?)')
-      .run(String(name).trim(), dialect || null, description || null);
+      .prepare('INSERT INTO projects (name, dialect, description, organization_id) VALUES (?, ?, ?, ?)')
+      .run(String(name).trim(), dialect || null, description || null, orgId);
     res.status(201).json(db.prepare('SELECT * FROM projects WHERE id = ?').get(info.lastInsertRowid));
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) return bad(res, 'A project with that name already exists');
@@ -361,9 +509,8 @@ api.post('/projects', requireSuperadmin, (req, res) => {
   }
 });
 
-api.patch('/projects/:id', requireSuperadmin, (req, res) => {
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
-  if (!project) return bad(res, 'Project not found', 404);
+api.patch('/projects/:id', requireOrgAdminOfProject, (req, res) => {
+  const project = req.project;
   const { name, dialect, description } = req.body ?? {};
   try {
     db.prepare('UPDATE projects SET name = ?, dialect = ?, description = ? WHERE id = ?').run(
@@ -381,9 +528,8 @@ api.patch('/projects/:id', requireSuperadmin, (req, res) => {
 
 // Permanently delete a project with all entries, recordings, and memberships.
 // Requires the exact project name as confirmation.
-api.delete('/projects/:id', requireSuperadmin, (req, res) => {
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
-  if (!project) return bad(res, 'Project not found', 404);
+api.delete('/projects/:id', requireOrgAdminOfProject, (req, res) => {
+  const project = req.project;
   const { confirm_name } = req.body ?? {};
   if (confirm_name !== project.name) {
     return bad(res, 'Type the exact project name to confirm deletion');
@@ -439,8 +585,8 @@ api.post('/projects/:id/members', requireProjectAdmin, async (req, res) => {
   const { email, name, password, role } = req.body ?? {};
   if (!email || !String(email).trim()) return bad(res, 'Email is required');
   const memberRole = ['admin', 'translator'].includes(role) ? role : 'member';
-  if (memberRole === 'admin' && !req.user.is_superadmin) {
-    return bad(res, 'Only the superadmin can assign project admins', 403);
+  if (memberRole === 'admin' && !isOrgAdmin(req.user, req.project.organization_id)) {
+    return bad(res, 'Only an organization admin can assign project admins', 403);
   }
 
   let user = db.prepare('SELECT * FROM users WHERE email = ?').get(String(email).trim());
@@ -468,8 +614,8 @@ api.post('/projects/:id/members', requireProjectAdmin, async (req, res) => {
     .get(user.id, req.project.id);
   if (existing) {
     if (existing.role === memberRole) return bad(res, 'Already a member of this project');
-    if ((existing.role === 'admin' || memberRole === 'admin') && !req.user.is_superadmin) {
-      return bad(res, 'Only the superadmin can change admin roles', 403);
+    if ((existing.role === 'admin' || memberRole === 'admin') && !isOrgAdmin(req.user, req.project.organization_id)) {
+      return bad(res, 'Only an organization admin can change admin roles', 403);
     }
     db.prepare('UPDATE memberships SET role = ? WHERE user_id = ? AND project_id = ?').run(
       memberRole, user.id, req.project.id
@@ -487,8 +633,8 @@ api.delete('/projects/:id/members/:userId', requireProjectAdmin, (req, res) => {
     .prepare('SELECT * FROM memberships WHERE user_id = ? AND project_id = ?')
     .get(req.params.userId, req.project.id);
   if (!membership) return bad(res, 'Not a member of this project', 404);
-  if (membership.role === 'admin' && !req.user.is_superadmin) {
-    return bad(res, 'Only the superadmin can remove a project admin', 403);
+  if (membership.role === 'admin' && !isOrgAdmin(req.user, req.project.organization_id)) {
+    return bad(res, 'Only an organization admin can remove a project admin', 403);
   }
   // Membership is removed; sessions stay valid but every request re-checks
   // membership, so access to this project's data ends immediately. Past
@@ -1701,7 +1847,7 @@ const csvUpload = multer({
 
 const MAX_IMPORT_ROWS = 10000;
 
-api.post('/projects/:id/import', requireSuperadmin, (req, res, next) => {
+api.post('/projects/:id/import', requireOrgAdminOfProject, (req, res, next) => {
   csvUpload.single('file')(req, res, (err) => {
     if (err) {
       return bad(res, err.code === 'LIMIT_FILE_SIZE' ? 'File is too large (max 10 MB)' : err.message);
@@ -1830,24 +1976,53 @@ api.get('/me/compensation', (req, res) => {
   });
 });
 
-// Everyone there is money to account for: current/past translators and anyone
-// with ledger or payment history.
-api.get('/compensation', requireSuperadmin, (req, res) => {
+// Compensation is ORGANIZATION authority, not platform administration: the
+// ledger quotes entry text (corpus content) and the org pays its own
+// contributors. Scoped to the orgs the caller administers. (Totals aggregate a
+// person's work across projects; fine while people work within one org.)
+function requireAnyOrgAdmin(req, res, next) {
+  const ids = adminOrgIdsFor(req.user);
+  if (!ids.length) return bad(res, 'Organization admin access required', 403);
+  req.adminOrgIds = ids;
+  next();
+}
+
+/** Is this user connected (membership or logged work) to a project in the
+ *  caller's admin orgs? */
+function userInAdminOrgs(req, userId) {
+  const ph = req.adminOrgIds.map(() => '?').join(',');
+  return !!db
+    .prepare(
+      `SELECT 1 FROM projects p
+       WHERE p.organization_id IN (${ph})
+         AND (EXISTS (SELECT 1 FROM memberships m WHERE m.project_id = p.id AND m.user_id = ?)
+              OR EXISTS (SELECT 1 FROM work_log w WHERE w.project_id = p.id AND w.user_id = ?))
+       LIMIT 1`
+    )
+    .get(...req.adminOrgIds, userId, userId);
+}
+
+// Everyone there is money to account for in the caller's orgs: current/past
+// translators and anyone with logged work there.
+api.get('/compensation', requireAnyOrgAdmin, (req, res) => {
+  const ph = req.adminOrgIds.map(() => '?').join(',');
   const people = db
     .prepare(
       `SELECT u.id, u.name, u.email FROM users u
-       WHERE u.id IN (SELECT user_id FROM memberships WHERE role = 'translator')
-          OR u.id IN (SELECT user_id FROM work_log)
-          OR u.id IN (SELECT user_id FROM payments)
+       WHERE u.id IN (SELECT m.user_id FROM memberships m JOIN projects p ON p.id = m.project_id
+                       WHERE m.role = 'translator' AND p.organization_id IN (${ph}))
+          OR u.id IN (SELECT w.user_id FROM work_log w JOIN projects p ON p.id = w.project_id
+                       WHERE p.organization_id IN (${ph}))
        ORDER BY u.name`
     )
-    .all();
+    .all(...req.adminOrgIds, ...req.adminOrgIds);
   res.json({ translators: people.map((p) => ({ ...p, ...totalsFor(p.id) })) });
 });
 
-api.get('/compensation/:userId', requireSuperadmin, (req, res) => {
+api.get('/compensation/:userId', requireAnyOrgAdmin, (req, res) => {
   const user = db.prepare('SELECT id, name, email FROM users WHERE id = ?').get(req.params.userId);
   if (!user) return bad(res, 'User not found', 404);
+  if (!userInAdminOrgs(req, user.id)) return bad(res, 'Organization admin access required', 403);
   const rates = db
     .prepare(
       `SELECT r.project_id, p.name AS project_name, r.type, r.rate_cents, r.updated_at
@@ -1868,14 +2043,16 @@ api.get('/compensation/:userId', requireSuperadmin, (req, res) => {
 });
 
 // Set or change a per-project rate; logs an audit row.
-api.put('/compensation/:userId/rates', requireSuperadmin, (req, res) => {
+api.put('/compensation/:userId/rates', requireAnyOrgAdmin, (req, res) => {
   const user = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.userId);
   if (!user) return bad(res, 'User not found', 404);
   const projectId = Number(req.body?.project_id);
   const type = req.body?.type;
   const rateCents = Math.round(Number(req.body?.rate_cents));
-  if (!projectId || !db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId)) {
-    return bad(res, 'A valid project is required');
+  const project = projectId ? db.prepare('SELECT organization_id FROM projects WHERE id = ?').get(projectId) : null;
+  if (!project) return bad(res, 'A valid project is required');
+  if (!req.adminOrgIds.includes(project.organization_id)) {
+    return bad(res, 'Organization admin access required', 403);
   }
   if (type !== 'translation' && type !== 'recording') return bad(res, 'Invalid rate type');
   if (!Number.isFinite(rateCents) || rateCents < 0) return bad(res, 'Rate must be zero or more');
@@ -1896,9 +2073,10 @@ api.put('/compensation/:userId/rates', requireSuperadmin, (req, res) => {
 });
 
 // Record a payment already made offline (the app never moves money).
-api.post('/compensation/:userId/payments', requireSuperadmin, (req, res) => {
+api.post('/compensation/:userId/payments', requireAnyOrgAdmin, (req, res) => {
   const user = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.userId);
   if (!user) return bad(res, 'User not found', 404);
+  if (!userInAdminOrgs(req, user.id)) return bad(res, 'Organization admin access required', 403);
   const amount = Math.round(Number(req.body?.amount_cents));
   if (!Number.isFinite(amount) || amount <= 0) return bad(res, 'Payment amount must be greater than zero');
   const paidOn = req.body?.paid_on?.trim() || new Date().toISOString().slice(0, 10);
@@ -1910,14 +2088,21 @@ api.post('/compensation/:userId/payments', requireSuperadmin, (req, res) => {
 });
 
 // Manual ledger adjustment (+/-): bonuses, corrections, pricing unrated work.
-api.post('/compensation/:userId/adjustments', requireSuperadmin, (req, res) => {
+api.post('/compensation/:userId/adjustments', requireAnyOrgAdmin, (req, res) => {
   const user = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.userId);
   if (!user) return bad(res, 'User not found', 404);
+  if (!userInAdminOrgs(req, user.id)) return bad(res, 'Organization admin access required', 403);
   const amount = Math.round(Number(req.body?.amount_cents));
   if (!Number.isFinite(amount) || amount === 0) return bad(res, 'Adjustment amount cannot be zero');
   const note = req.body?.note?.trim();
   if (!note) return bad(res, 'An adjustment note is required');
   const projectId = req.body?.project_id ? Number(req.body.project_id) : null;
+  if (projectId) {
+    const proj = db.prepare('SELECT organization_id FROM projects WHERE id = ?').get(projectId);
+    if (!proj || !req.adminOrgIds.includes(proj.organization_id)) {
+      return bad(res, 'Organization admin access required', 403);
+    }
+  }
   db.prepare(
     `INSERT INTO work_log (user_id, project_id, type, amount_cents, note, created_by)
      VALUES (?, ?, 'adjustment', ?, ?, ?)`
