@@ -1206,7 +1206,7 @@ async function renderEntryDetail(id) {
         <form id="audio-form" style="margin-top:0.8rem">
           <div class="form-row">
             <label class="field"><span>Audio file</span>
-              <input type="file" name="file" accept=".wav,.mp3,.m4a,audio/*" required></label>
+              <input type="file" name="file" accept=".wav,.flac,.mp3,.m4a,audio/*" required></label>
             <label class="field"><span>Speaker name / ID</span>
               <input type="text" name="speaker" placeholder="e.g. Elder Mary T."></label>
             <label class="field"><span>Recording notes</span>
@@ -1341,7 +1341,7 @@ async function renderEntryDetail(id) {
           ? `<div class="versions-head">Previous versions (superseded masters, kept for the archive)</div>` +
             versions.map((v) => `
               <div class="version-row">
-                <span>${fmtDuration(v.duration_seconds)} · ${(v.size_bytes / 1024 / 1024).toFixed(1)} MB · ${v.archive_class === 'legacy_lossy' ? 'legacy' : 'master'}${v.sample_rate_hz ? ` · ${(v.sample_rate_hz / 1000).toFixed(1)} kHz` : ''} · ${fmtDate(v.created_at)}</span>
+                <span>${fmtDuration(v.duration_seconds)} · ${(v.size_bytes / 1024 / 1024).toFixed(1)} MB · ${{ legacy_lossy: 'legacy', lossy_source: 'lossy source' }[v.archive_class] ?? 'master'}${v.sample_rate_hz ? ` · ${(v.sample_rate_hz / 1000).toFixed(1)} kHz` : ''} · ${fmtDate(v.created_at)}</span>
                 <a class="btn ghost small" href="/api/audio/${v.id}/master">⬇ Master</a>
               </div>`).join('')
           : '<div class="empty small">No previous versions — this is the first recording.</div>';

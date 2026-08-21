@@ -30,6 +30,15 @@ export async function probeAudio(filePath) {
   };
 }
 
+// Archive classification from the ACTUAL probed codec — never from the filename
+// or upload route. Lossless means actually lossless: PCM WAV (incl. float),
+// FLAC, ALAC. MP3/AAC/anything else lossy is a 'lossy_source' (kept, exportable,
+// but never described as a master). 'legacy_lossy' is reserved for pre-migration
+// historical rows and is never assigned to new uploads.
+const LOSSLESS_CODEC_RE = /\b(pcm|flac|alac)\b|float/i;
+export const classifyArchive = (codec) =>
+  LOSSLESS_CODEC_RE.test(String(codec ?? '')) ? 'lossless_master' : 'lossy_source';
+
 // Streaming SHA-256 so we never read a 500 MB master fully into memory.
 export function sha256File(absPath) {
   return new Promise((resolve, reject) => {
