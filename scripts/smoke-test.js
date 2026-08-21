@@ -52,6 +52,17 @@ function makeWav(seconds = 1, rate = 8000) {
   return buf;
 }
 
+// Minimal valid MP3: MPEG-1 Layer III CBR frames (128 kbps / 44.1 kHz), ~1s.
+function makeMp3(frames = 40) {
+  const size = 417; // 144 * 128000 / 44100, no padding
+  const buf = Buffer.alloc(size * frames);
+  for (let i = 0; i < frames; i++) {
+    const o = i * size;
+    buf[o] = 0xff; buf[o + 1] = 0xfb; buf[o + 2] = 0x90; buf[o + 3] = 0x00;
+  }
+  return buf;
+}
+
 const sa = client();
 const member = client();
 const stranger = client();
@@ -1195,6 +1206,48 @@ check('revoked recording drops out of purpose exports', zipHas(zAsr, '"recording
 zFull = await sa.raw('GET', `/api/projects/${cpId}/export-bundle`);
 check('owner archive keeps the revoked recording, flagged + audited',
   zipHas(zFull, '"recording_count": 2') && zipHas(zFull, '"action": "revoke"'));
+
+// --- archival correctness (hardening 4, 9, 6) ---
+// #9: sha256 exists at INGESTION and matches the actual bytes.
+r = await sa.req('GET', `/api/entries/${cpEntry2}`);
+const shaRec = r.data.audio[0];
+check('sha256 present at ingestion', /^[0-9a-f]{64}$/.test(shaRec.sha256 ?? ''), JSON.stringify(shaRec.sha256));
+{
+  const m = await sa.raw('GET', `/api/audio/${shaRec.id}/master`);
+  const crypto = await import('node:crypto');
+  const rehash = crypto.createHash('sha256').update(m.buf).digest('hex');
+  check('stored sha256 matches the master bytes', rehash === shaRec.sha256, `${rehash} vs ${shaRec.sha256}`);
+}
+
+// #4: archive_class comes from the probed codec, not the filename/route.
+check('WAV upload classified lossless_master', shaRec.archive_class === 'lossless_master', shaRec.archive_class);
+r = await sa.req('POST', '/api/entries', { project_id: cpId, dene_text: 'łue', english_text: 'fish' });
+const lossyEntry = r.data.id;
+fd = new FormData();
+fd.append('file', new Blob([makeMp3()], { type: 'audio/mpeg' }), 'historical.mp3');
+fd.append('language', 'dene');
+r = await sa.req('POST', `/api/entries/${lossyEntry}/audio`, fd, true);
+check('MP3 upload accepted but classified lossy_source', r.status === 201 && r.data.archive_class === 'lossy_source',
+  JSON.stringify({ s: r.status, c: r.data.archive_class, codec: r.data.codec }));
+check('lossy upload still gets an ingestion sha256', /^[0-9a-f]{64}$/.test(r.data.sha256 ?? ''));
+const lossyStored = r.data.stored_name;
+
+// #6: the OWNER archive contains every retained version with lineage; purpose
+// exports stay current-only.
+const v1Stored = r2.stored_name; // cpEntry2's first (superseded soon) version
+fd = new FormData();
+fd.append('file', new Blob([makeWav(2)], { type: 'audio/wav' }), 'v2.wav');
+fd.append('language', 'dene');
+const v2 = (await sa.req('POST', `/api/entries/${cpEntry2}/audio`, fd, true)).data;
+check('re-record supersedes for the version test', v2.replaced === true && v2.supersedes_audio_id === shaRec.id);
+zFull = await sa.raw('GET', `/api/projects/${cpId}/export-bundle`);
+check('owner archive contains the superseded master', zipHas(zFull, v1Stored), v1Stored);
+check('owner archive contains the current master', zipHas(zFull, v2.stored_name));
+check('owner archive carries version lineage', zipHas(zFull, '"is_current": false') && zipHas(zFull, '"supersedes_audio_id": ' + shaRec.id));
+check('owner archive labels the lossy source', zipHas(zFull, lossyStored) && zipHas(zFull, '"lossy_source"'));
+check('owner archive counts superseded versions', zipHas(zFull, '"superseded_version_count": 1'));
+zAsr = await sa.raw('GET', `/api/projects/${cpId}/export-bundle?purpose=asr`);
+check('purpose export excludes superseded versions', !zipHas(zAsr, v1Stored));
 
 // cleanup: project then profile (suite stays repeatable; snapshots die with the project)
 await sa.req('DELETE', `/api/projects/${cpId}`, { confirm_name: cpName });

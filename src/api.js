@@ -7,7 +7,7 @@ import { parseFile } from 'music-metadata';
 
 import db, { AUDIO_DIR, REQUESTS_DIR, roleIn, projectsFor, projectIdsFor, orgRole, orgsFor } from './db.js';
 import { embed, toBlob, fromBlob, cosine, MODEL } from './embed.js';
-import { MASTERS_DIR, DERIVED_DIR, probeAudio, enqueueDerivative, sha256File } from './audio.js';
+import { MASTERS_DIR, DERIVED_DIR, probeAudio, enqueueDerivative, sha256File, classifyArchive } from './audio.js';
 import { createRequire } from 'node:module';
 import { backfillEmbeddings } from '../scripts/embed-backfill.js';
 import { APP_URL, inviteEmail, requestFormEmail, requestNotifyEmail, resetEmail, sendMail } from './mail.js';
@@ -1276,13 +1276,13 @@ api.post('/entries/:id/translate', loadEntry, rejectTranslators, (req, res) => {
 // Audio attachments
 // ---------------------------------------------------------------------------
 
-const AUDIO_EXTS = new Set(['.wav', '.mp3', '.m4a']);
+const AUDIO_EXTS = new Set(['.wav', '.flac', '.mp3', '.m4a']);
 const MAX_AUDIO_BYTES = 500 * 1024 * 1024; // 500 MB
 
 // Content-Type served for a recording is derived from its (server-generated)
 // extension, never from the client-supplied upload MIME — a spoofed type like
 // text/html served inline would otherwise execute as script on this origin.
-const AUDIO_MIME = { '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4' };
+const AUDIO_MIME = { '.wav': 'audio/wav', '.flac': 'audio/flac', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4' };
 const audioMimeFor = (storedName) =>
   AUDIO_MIME[path.extname(storedName).toLowerCase()] || 'application/octet-stream';
 
@@ -1303,7 +1303,7 @@ const upload = multer({
   fileFilter: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     if (!AUDIO_EXTS.has(ext)) {
-      return cb(new Error('Unsupported audio format — use WAV, MP3, or M4A'));
+      return cb(new Error('Unsupported audio format — use WAV, FLAC, MP3, or M4A'));
     }
     cb(null, true);
   },
@@ -1336,7 +1336,7 @@ const rmAudioFiles = (row) => audioFiles(row).forEach((f) => fs.rm(f, { force: t
 // current version (if any) is superseded, never overwritten or deleted. Kicks off
 // background derivative generation. Returns { audioId, hadCurrent }. Never bills —
 // callers decide billing (bill once, on the first version for a slot).
-function saveMasterRecording({ entry, userId, file, probe, language, speaker, notes, captureMethod, captureDevice }) {
+function saveMasterRecording({ entry, userId, file, probe, sha256 = null, language, speaker, notes, captureMethod, captureDevice }) {
   const storedName = `masters/${userId}/${file.filename}`;
   const prior = db
     .prepare('SELECT id FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ? AND is_current = 1')
@@ -1344,6 +1344,9 @@ function saveMasterRecording({ entry, userId, file, probe, language, speaker, no
   // Stamp the project's default consent profile (if any) onto the new version at
   // save time — the recording carries its own immutable permission snapshot (#6).
   const consent = consentSnapshotFor(entry.project_id);
+  // archive_class comes from the PROBED codec, never the filename or route: an
+  // uploaded MP3/M4A is a 'lossy_source', not a master (hardening #4).
+  const archiveClass = classifyArchive(probe.codec);
   const audioId = db.transaction(() => {
     if (prior) db.prepare('UPDATE audio_files SET is_current = 0 WHERE id = ?').run(prior.id);
     const id = db
@@ -1351,14 +1354,14 @@ function saveMasterRecording({ entry, userId, file, probe, language, speaker, no
         `INSERT INTO audio_files
            (entry_id, stored_name, original_name, mime_type, size_bytes, duration_seconds,
             language, speaker, recording_notes, uploaded_by,
-            is_current, supersedes_audio_id, archive_class,
+            is_current, supersedes_audio_id, archive_class, sha256,
             sample_rate_hz, channels, bit_depth, codec, capture_method, capture_device)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'lossless_master', ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         entry.id, storedName, file.originalname, file.mimetype || 'application/octet-stream',
         file.size, probe.duration, language, speaker, notes, userId,
-        prior?.id ?? null, probe.sampleRate, probe.channels, probe.bitDepth, probe.codec,
+        prior?.id ?? null, archiveClass, sha256, probe.sampleRate, probe.channels, probe.bitDepth, probe.codec,
         captureMethod || null, captureDevice || null
       ).lastInsertRowid;
     if (consent) {
@@ -1386,16 +1389,18 @@ api.post('/entries/:id/audio', loadEntry, rejectTranslators, audioUpload, async 
     return bad(res, 'Add the translation before recording this phrase');
   }
   const language = req.body.language === 'english' ? 'english' : 'dene';
-  let probe;
+  let probe, sha256;
   try {
-    probe = await probeAudio(filePath);
+    // Checksum at INGESTION (hardening #9): the hash exists from the moment the
+    // source enters the corpus, server-computed, never client-supplied.
+    [probe, sha256] = await Promise.all([probeAudio(filePath), sha256File(filePath)]);
   } catch {
     fs.rm(filePath, { force: true }, () => {});
     return bad(res, 'Could not read that audio file — it may be corrupt or in an unsupported format. The entry was not changed.');
   }
 
   const { audioId, hadCurrent } = saveMasterRecording({
-    entry: req.entry, userId: req.user.id, file: req.file, probe, language,
+    entry: req.entry, userId: req.user.id, file: req.file, probe, sha256, language,
     speaker: req.body.speaker?.trim() || null,
     notes: req.body.recording_notes?.trim() || null,
     captureMethod: req.body.capture_method === 'browser_recording' ? 'browser_recording' : 'uploaded_file',
@@ -1765,9 +1770,11 @@ api.post('/work/:id/submit', loadWorkItem, (req, res) => {
       return bad(res, 'Add the translation before recording this phrase');
     }
     const language = item.language === 'english' ? 'english' : 'dene';
-    let probe;
+    let probe, sha256;
     try {
-      probe = await probeAudio(filePath); // before the transactions — no awaits inside them
+      // Probe + checksum-at-ingestion (hardening #9), before the transaction —
+      // no awaits inside it.
+      [probe, sha256] = await Promise.all([probeAudio(filePath), sha256File(filePath)]);
     } catch {
       fs.rm(filePath, { force: true }, () => {});
       return bad(res, 'Could not read that audio file — it may be corrupt or in an unsupported format. Nothing was changed.');
@@ -1792,7 +1799,7 @@ api.post('/work/:id/submit', loadWorkItem, (req, res) => {
           // saveMasterRecording's internal transaction nests as a SAVEPOINT here,
           // so audio version + acceptance + ledger commit or roll back together.
           const { audioId } = saveMasterRecording({
-            entry, userId: req.user.id, file: req.file, probe, language,
+            entry, userId: req.user.id, file: req.file, probe, sha256, language,
             speaker: req.body.speaker?.trim() || null,
             notes: req.body.recording_notes?.trim() || null,
             captureMethod: 'browser_recording',
@@ -1986,12 +1993,17 @@ api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => 
        WHERE e.project_id = ?${kindSql} ORDER BY e.id`
     )
     .all(req.project.id, ...kindArg);
+  // The OWNER archive (no purpose filter) contains EVERY retained audio version
+  // — current and superseded masters alike — with lineage; that's the
+  // portability promise (hardening #6). Purpose-filtered dataset exports remain
+  // current + permitted + non-revoked only.
+  const versionSql = purpose ? ' AND a.is_current = 1' : '';
   const recs = db
     .prepare(
       `SELECT a.*, uu.name AS uploaded_by_name FROM audio_files a
        JOIN entries e ON e.id = a.entry_id
        JOIN users uu ON uu.id = a.uploaded_by
-       WHERE e.project_id = ? AND a.is_current = 1${kindSql}${purposeSql}
+       WHERE e.project_id = ?${versionSql}${kindSql}${purposeSql}
        ORDER BY a.entry_id, a.language, a.id`
     )
     .all(req.project.id, ...kindArg);
@@ -2018,7 +2030,7 @@ api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => 
   const checksumLines = [];
   const audioByEntry = new Map();
   const recordingsJson = [];
-  let masterCount = 0, legacyCount = 0, derivCount = 0, missing = 0;
+  let masterCount = 0, legacyCount = 0, lossyCount = 0, supersededCount = 0, derivCount = 0, missing = 0;
 
   for (const a of recs) {
     const abs = path.join(AUDIO_DIR, a.stored_name);
@@ -2031,7 +2043,13 @@ api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => 
     }
     files.push({ abs, name: bundlePath });
     if (sha) checksumLines.push(`${sha}  ${bundlePath}`);
-    if (a.archive_class === 'legacy_lossy') legacyCount++; else masterCount++;
+    if (a.is_current) {
+      if (a.archive_class === 'legacy_lossy') legacyCount++;
+      else if (a.archive_class === 'lossy_source') lossyCount++;
+      else masterCount++;
+    } else {
+      supersededCount++;
+    }
 
     let derivPath = null;
     if (a.playback_stored_name) {
@@ -2044,9 +2062,14 @@ api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => 
       }
     }
 
-    if (!audioByEntry.has(a.entry_id)) audioByEntry.set(a.entry_id, []);
-    audioByEntry.get(a.entry_id).push({ language: a.language, file: bundlePath });
+    // Entry listings reference only CURRENT recordings; superseded versions are
+    // reachable through recordings.json's lineage.
+    if (a.is_current) {
+      if (!audioByEntry.has(a.entry_id)) audioByEntry.set(a.entry_id, []);
+      audioByEntry.get(a.entry_id).push({ language: a.language, file: bundlePath });
+    }
     recordingsJson.push({
+      audio_id: a.id, is_current: !!a.is_current, supersedes_audio_id: a.supersedes_audio_id,
       entry_id: a.entry_id, language: a.language, speaker: a.speaker, uploaded_by: a.uploaded_by_name,
       archive_class: a.archive_class, duration_seconds: a.duration_seconds,
       sample_rate_hz: a.sample_rate_hz, channels: a.channels, bit_depth: a.bit_depth, codec: a.codec,
@@ -2088,7 +2111,7 @@ api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => 
   }, null, 2);
   const recordingsJsonStr = JSON.stringify({ recordings: recordingsJson }, null, 2);
   const manifest = {
-    schema_version: '1.1',
+    schema_version: '1.2',
     exported_at: new Date().toISOString(),
     application_version: pkg.version,
     organization: orgRow, // the data owner (#5)
@@ -2096,20 +2119,22 @@ api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => 
     kind: kind || 'all',
     permission_filter: purpose || null,
     entry_count: rows.length,
-    recording_count: masterCount + legacyCount,
+    recording_count: masterCount + legacyCount + lossyCount, // current recordings
     master_audio_count: masterCount,
     legacy_lossy_audio_count: legacyCount,
+    lossy_source_audio_count: lossyCount,
+    superseded_version_count: supersededCount,
     derivative_count: derivCount,
     missing_files: missing,
     consent: {
       consented: census.consented ?? 0,
       consent_unknown: census.consent_unknown ?? 0,
       revoked: census.revoked ?? 0,
-      excluded_by_purpose_filter: purpose ? (census.total ?? 0) - (masterCount + legacyCount) : 0,
+      excluded_by_purpose_filter: purpose ? (census.total ?? 0) - (masterCount + legacyCount + lossyCount) : 0,
     },
     note: purpose
-      ? `Purpose-filtered export ("${purpose}"): only recordings whose consent snapshot explicitly allows this use are included; consent-unknown and revoked recordings are excluded. Permission is never inferred from membership or visibility.`
-      : 'Contains the current version of each recording. Superseded (re-recorded) master versions are retained in the application and are not included in this archive.',
+      ? `Purpose-filtered export ("${purpose}"): only CURRENT recordings whose consent snapshot explicitly allows this use are included; consent-unknown, revoked, and superseded recordings are excluded. Permission is never inferred from membership or visibility.`
+      : 'Complete owner archive: every retained audio version is included — current recordings and superseded masters alike, with lineage in recordings.json (audio_id / is_current / supersedes_audio_id).',
   };
   const manifestStr = JSON.stringify(manifest, null, 2);
   const readme = [
@@ -2120,10 +2145,11 @@ api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => 
     `Contents:`,
     `  manifest.json     summary + counts`,
     `  entries.csv/json  the dictionary/phrase entries`,
-    `  recordings.json   one record per current recording, with audio properties + sha256`,
+    `  recordings.json   one record per audio version${purpose ? ' (current only in purpose exports)' : ' — current AND superseded, with lineage (audio_id / is_current / supersedes_audio_id)'}, with audio properties + sha256`,
     `  speakers.json     speakers and uploaders with counts`,
     `  checksums.sha256  SHA-256 of every file below (verify: sha256sum -c checksums.sha256)`,
-    `  audio/masters/    lossless WAV masters (source of truth)`,
+    `  audio/masters/    losslessly-captured masters and uploaded source files (archive_class`,
+    `                    in recordings.json says which: lossless_master vs lossy_source)`,
     `  audio/derived/    disposable mono-MP3 playback copies (regenerable from masters)`,
     `  audio/<uid>/      legacy lossy source recordings (pre-dating lossless capture)`,
     ``,
