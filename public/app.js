@@ -307,8 +307,8 @@ function renderTopbar() {
   $('#nav-jobs').hidden = !state.me.user.is_superadmin;
   $('#nav-compensation').hidden = !isOrgAdmin();
   $('#nav-org').hidden = !isOrgOwner();
-  $('#topbar nav a[data-nav="entries"]').hidden = isTranslator();
-  $('#topbar nav a[data-nav="phrases"]').hidden = isTranslator();
+  // Translators browse the Dictionary and Phrases too (read-only; the server
+  // blocks them from creating/editing entries).
 
   const sw = $('#project-switcher');
   const projects = state.me.projects;
@@ -961,7 +961,7 @@ async function renderEntries(kind = 'word') {
           <a class="btn secondary small" href="/api/projects/${ap.id}/export?format=csv&kind=${kind}">Export CSV</a>
           <a class="btn secondary small" href="/api/projects/${ap.id}/export?format=json&kind=${kind}">Export JSON</a>
           <a class="btn secondary small" href="/api/projects/${ap.id}/export-bundle?kind=${kind}" title="Complete archive: entries + master audio + checksums">⬇ Full archive (ZIP)</a>` : ''}
-        <a class="btn" href="#/${isPhrase ? 'phrases' : 'entries'}/new">＋ New ${isPhrase ? 'phrase' : 'entry'}</a>
+        ${isTranslator() ? '' : `<a class="btn" href="#/${isPhrase ? 'phrases' : 'entries'}/new">＋ New ${isPhrase ? 'phrase' : 'entry'}</a>`}
       </div>
     </div>
     <div class="filters">
@@ -1154,11 +1154,8 @@ async function renderEntryDetail(id) {
 
   const isPhrase = entry.kind === 'phrase';
   const incomplete = !entry.dene_text || !entry.english_text;
-  // Translators reach entries from their work log and can't see the dictionary
-  // tabs, so send them back there instead.
-  const fromWorkLog = isTranslator();
-  const backHref = fromWorkLog ? '#/earnings' : (isPhrase ? '#/phrases' : '#/entries');
-  const backLabel = fromWorkLog ? 'work log' : (isPhrase ? 'phrases' : 'dictionary');
+  const backHref = isPhrase ? '#/phrases' : '#/entries';
+  const backLabel = isPhrase ? 'phrases' : 'dictionary';
   setActiveNav(isPhrase ? 'phrases' : 'entries');
   const ro = !entry.can_edit;
   const isAdmin = entry.role === 'admin';
@@ -2617,7 +2614,7 @@ function route() {
   if (Recorder.session) Recorder.cancel(); // navigating away releases the mic
   releaseClaims(recSession); // return any unfinished claimed work to the queue
   releaseClaims(transSession);
-  const hash = location.hash || '#/entries';
+  const hash = location.hash || '#/dashboard'; // Dashboard is the home tab
   let m;
   // Views that work without a session:
   if ((m = hash.match(/^#\/set-password\/([a-f0-9]{64})$/))) { renderSetPassword(m[1]); return; }
@@ -2626,11 +2623,13 @@ function route() {
   if ((m = hash.match(/^#\/request\/([a-f0-9]{64})$/))) { renderRequestForm(m[1]); return; }
   if (!state.me) { renderLogin(); return; }
   if (isTranslator()) {
-    // Translators see only their dashboard, the recording session, and the
-    // translation session.
+    // Translators get their session-focused dashboard plus read-only browsing
+    // of the Dictionary and Phrases (creating/editing stays server-blocked).
     if (hash === '#/record') renderRecordSession();
     else if (hash === '#/translate') renderTranslateSession();
     else if (hash === '#/earnings') renderMyEarnings();
+    else if (hash === '#/entries') renderEntries('word');
+    else if (hash === '#/phrases') renderEntries('phrase');
     else if ((m = hash.match(/^#\/entries\/(\d+)$/))) renderEntryDetail(m[1]);
     else if (hash === '#/dashboard') renderTranslatorDashboard();
     else location.hash = '#/dashboard';

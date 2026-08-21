@@ -39,7 +39,7 @@ admins; project admins manage their own project's members. There is no public si
 | Org owner / org admin | Full authority over their organization's projects: create/edit/delete projects, assign project admins, compensation, exports |
 | Project admin | Manage members, review/verify entries, export, edit any entry — in their project only |
 | Member | Create entries, edit/delete their own entries, upload audio, search within their projects |
-| Translator | Recording and translating only — a stripped-down app with a recording session (entries without audio) and a translation session (incomplete phrases). Can complete a phrase's missing side but cannot otherwise create or edit entries |
+| Translator | Recording and translating through claimed work sessions, plus read-only browsing of the Dictionary and Phrases. Can complete an entry's missing side via the translation session but cannot otherwise create or edit entries |
 
 Translators land on a dashboard with a **Start recording session** button and, whenever
 phrases are awaiting translation, a count and a **Start translations session** button.
