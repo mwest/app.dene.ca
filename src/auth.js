@@ -32,6 +32,14 @@ export function destroySession(token) {
   db.prepare('DELETE FROM sessions WHERE token = ?').run(hashSessionToken(token));
 }
 
+/** Sign the user out everywhere EXCEPT the session identified by keepRawToken
+ *  (used after a self-service password change: other devices lose access, the
+ *  session that changed the password stays signed in). */
+export function destroyOtherSessions(userId, keepRawToken) {
+  db.prepare('DELETE FROM sessions WHERE user_id = ? AND token <> ?')
+    .run(userId, hashSessionToken(keepRawToken ?? ''));
+}
+
 export function userForToken(token) {
   if (!token) return null;
   db.prepare(`DELETE FROM sessions WHERE expires_at < datetime('now')`).run();

@@ -16,6 +16,7 @@ import {
   cookieOptions,
   createSession,
   destroySession,
+  destroyOtherSessions,
   hashPassword,
   requireAuth,
   requireSuperadmin,
@@ -315,6 +316,9 @@ api.post('/me/password', (req, res) => {
     hashPassword(new_password),
     req.user.id
   );
+  // A password change signs out every OTHER session (a stolen/stale session
+  // must not survive the change); the session that made it stays signed in.
+  destroyOtherSessions(req.user.id, req.cookies[COOKIE_NAME]);
   res.json({ ok: true });
 });
 
@@ -1745,6 +1749,13 @@ api.post('/projects/:id/work/claim', (req, res) => {
 // Submit a claimed work item; auto-accepts and bills in one transaction.
 api.post('/work/:id/submit', loadWorkItem, (req, res) => {
   const item = req.workItem;
+  // Submitting is ASSIGNEE-only: acceptance bills item.assigned_to, so an admin
+  // submitting on a contributor's behalf would credit the contributor for work
+  // they didn't do (and attribute the admin's upload to them). Admins may still
+  // RELEASE a stuck claim; the future review workflow is the admin lever.
+  if (item.assigned_to !== req.user.id) {
+    return bad(res, 'Only the assigned contributor can submit this work item', 403);
+  }
   if (item.status === 'accepted') return res.json(submitResult(item)); // idempotent replay
   if (item.status !== 'claimed') return bad(res, 'This work item is no longer active', 409);
 

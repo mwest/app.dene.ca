@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS consent_changes (
 
 CREATE TABLE IF NOT EXISTS projects (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  name        TEXT NOT NULL UNIQUE,
+  name        TEXT NOT NULL,
   dialect     TEXT,
   description TEXT,
   -- P2-1: per-project public visibility, unused in v1 but present in the model
@@ -109,7 +109,9 @@ CREATE TABLE IF NOT EXISTS projects (
   -- Default consent profile stamped onto new recordings (#6); NULL = new
   -- recordings start consent-unknown until an admin assigns permissions.
   default_consent_profile_id INTEGER REFERENCES consent_profiles(id),
-  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  -- Names are unique WITHIN an organization; different orgs may reuse a name.
+  UNIQUE (organization_id, name)
 );
 
 CREATE TABLE IF NOT EXISTS memberships (
@@ -509,6 +511,37 @@ db.transaction(() => {
     db.prepare(`UPDATE payments SET organization_id = ? WHERE organization_id IS NULL`).run(orgs[0].id);
   }
 })();
+
+// Migration: project names are unique PER ORGANIZATION, not globally. SQLite
+// can't drop a column UNIQUE constraint, so older databases get the projects
+// table rebuilt once (same dance as the memberships role migration; child FKs
+// reference the table by name and survive the rename).
+const projTableSql = db
+  .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'projects'`)
+  .get().sql;
+if (!/UNIQUE\s*\(\s*organization_id\s*,\s*name\s*\)/i.test(projTableSql)) {
+  db.pragma('foreign_keys = OFF');
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE projects_new (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT NOT NULL,
+        dialect     TEXT,
+        description TEXT,
+        is_public   INTEGER NOT NULL DEFAULT 0,
+        organization_id INTEGER REFERENCES organizations(id),
+        default_consent_profile_id INTEGER REFERENCES consent_profiles(id),
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (organization_id, name)
+      );
+      INSERT INTO projects_new (id, name, dialect, description, is_public, organization_id, default_consent_profile_id, created_at)
+        SELECT id, name, dialect, description, is_public, organization_id, default_consent_profile_id, created_at FROM projects;
+      DROP TABLE projects;
+      ALTER TABLE projects_new RENAME TO projects;
+    `);
+  })();
+  db.pragma('foreign_keys = ON');
+}
 
 // Repair: recording ledger rows written before billWorkItem stamped entry_id
 // have entry_id NULL, which left the work-log "Detail" column blank. Recover it

@@ -404,8 +404,13 @@ check('atomic claim: exactly one translator gets the sole phrase', aGot !== bGot
 const holder = aGot ? A : B, holderId = aGot ? aId : bId;
 const oneWi = itemFor(aGot ? ca : cb, onePhrase).work_item_id;
 
+// Submitting is assignee-only: an admin cannot submit a contributor's claimed
+// item (acceptance would bill the contributor for the admin's work).
+let s = await sa.req('POST', `/api/work/${oneWi}/submit`, { english_text: 'hijack' });
+check('admin cannot submit a contributor\'s claimed work item', s.status === 403, JSON.stringify(s.data));
+
 // (3) idempotent double-submit + (bill exactly once)
-let s = await holder.req('POST', `/api/work/${oneWi}/submit`, { english_text: 'money' });
+s = await holder.req('POST', `/api/work/${oneWi}/submit`, { english_text: 'money' });
 check('translation submit accepted + applied', s.status === 200 && s.data.entry.english_text === 'money', JSON.stringify(s.data));
 s = await holder.req('POST', `/api/work/${oneWi}/submit`, { english_text: 'money-again' });
 check('idempotent re-submit: no re-apply', s.status === 200 && s.data.entry.english_text === 'money');
@@ -437,7 +442,9 @@ check('stale submit did not bill A', r.data.work.filter((w) => w.type === 'trans
 r = await sa.req('POST', '/api/entries', { project_id: wiProj, kind: 'phrase', dene_text: 'tsá', english_text: '' });
 const relPhrase = r.data.id;
 const relWi = itemFor(await claim(A, { type: 'translation', limit: 20 }), relPhrase).work_item_id;
-await A.req('POST', `/api/work/${relWi}/release`);
+// Admins CAN release someone else's stuck claim (unlike submit).
+r = await sa.req('POST', `/api/work/${relWi}/release`);
+check('admin can release a contributor\'s stuck claim', r.status === 200);
 check('released item is immediately re-claimable', !!itemFor(await claim(B, { type: 'translation', limit: 20 }), relPhrase));
 
 // (6) per-speaker recording + (4) no double-bill on legacy re-record
@@ -1148,6 +1155,19 @@ check('translator completes org2 work', r.status === 200);
 r = await oa.req('POST', `/api/compensation/${translatorId}/payments`, { amount_cents: 100 });
 check('org2 admin records an org2 payment', r.status === 201, JSON.stringify(r.data));
 
+// Project names are unique PER ORGANIZATION — two orgs can both have "Winter Words".
+const crossName = `Cross Name ${Date.now()}`;
+r = await sa.req('POST', '/api/projects', { name: crossName, organization_id: mainOrg.id });
+check('org1 creates the shared-name project', r.status === 201, JSON.stringify(r.data));
+const crossOrg1 = r.data.id;
+r = await oa.req('POST', '/api/projects', { name: crossName });
+check('a different org can reuse the same project name', r.status === 201, JSON.stringify(r.data));
+const crossOrg2 = r.data.id;
+r = await oa.req('POST', '/api/projects', { name: crossName });
+check('duplicate name within the SAME org still rejected', r.status === 400, JSON.stringify(r.data));
+await sa.req('DELETE', `/api/projects/${crossOrg1}`, { confirm_name: crossName });
+await sa.req('DELETE', `/api/projects/${crossOrg2}`, { confirm_name: crossName });
+
 r = await oa.req('GET', `/api/compensation/${translatorId}`);
 check('org2 admin sees ONLY org2 work', r.status === 200 &&
   r.data.work.length === 1 && r.data.work[0].amount_cents === 700, JSON.stringify(r.data.work));
@@ -1384,6 +1404,22 @@ if (BASE.includes('localhost')) {
   } catch (e) {
     check('hashed-session DB inspection ran', false, e.message);
   }
+}
+
+// --- password change terminates other sessions ---
+{
+  const pwEmail = `pwsess-${Date.now()}@test.ca`;
+  r = await sa.req('POST', '/api/users', { email: pwEmail, name: 'Pw Sess', password: 'pwsess-pass-1' });
+  const s1 = client(), s2 = client();
+  await s1.req('POST', '/api/login', { email: pwEmail, password: 'pwsess-pass-1' });
+  await s2.req('POST', '/api/login', { email: pwEmail, password: 'pwsess-pass-1' });
+  check('both sessions live before the change', (await s2.req('GET', '/api/me')).status === 200);
+  r = await s1.req('POST', '/api/me/password', { current_password: 'pwsess-pass-1', new_password: 'pwsess-pass-2' });
+  check('password change succeeds', r.status === 200, JSON.stringify(r.data));
+  check('the session that changed the password stays signed in', (await s1.req('GET', '/api/me')).status === 200);
+  check('other sessions are terminated by the password change', (await s2.req('GET', '/api/me')).status === 401);
+  r = await s2.req('POST', '/api/login', { email: pwEmail, password: 'pwsess-pass-2' });
+  check('other device signs back in with the NEW password', r.status === 200);
 }
 
 console.log(failures ? `\n${failures} FAILURES` : '\nAll checks passed.');
