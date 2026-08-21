@@ -3,7 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const ROOT = path.join(import.meta.dirname, '..');
-export const DATA_DIR = path.join(ROOT, 'data');
+// DENE_DATA_DIR overrides the data location (used by the test runner to give
+// each `npm test` an isolated throwaway database + audio store).
+export const DATA_DIR = process.env.DENE_DATA_DIR || path.join(ROOT, 'data');
 // Audio lives at data/audio/<uploader user id>/<file>; stored_name in the DB
 // is the path relative to AUDIO_DIR (e.g. "3/a1b2c3.mp3").
 export const AUDIO_DIR = path.join(DATA_DIR, 'audio');
@@ -507,6 +509,14 @@ db.transaction(() => {
     db.prepare(`UPDATE payments SET organization_id = ? WHERE organization_id IS NULL`).run(orgs[0].id);
   }
 })();
+
+// Migration (hardening #10): session tokens are now stored hashed. Existing
+// rows hold raw tokens that would no longer resolve — clear them once (everyone
+// signs in again), gated by PRAGMA user_version so this never re-runs.
+if (db.pragma('user_version', { simple: true }) < 1) {
+  db.exec('DELETE FROM sessions');
+  db.pragma('user_version = 1');
+}
 
 export default db;
 

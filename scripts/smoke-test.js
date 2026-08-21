@@ -77,6 +77,15 @@ check('wrong password rejected', r.status === 401);
 r = await sa.req('POST', '/api/login', { email: SA_EMAIL, password: SA_PASS });
 check('superadmin login', r.status === 200, JSON.stringify(r.data));
 
+// Fresh-install bootstrap (documented flow): a brand-new deployment has no
+// organization yet — provision one, making this superadmin its owner. No-op on
+// an already-migrated database.
+r = await sa.req('GET', '/api/me');
+if ((r.data.orgs ?? []).length === 0) {
+  r = await sa.req('POST', '/api/orgs', { name: 'Dene Voice Project' });
+  check('fresh install: superadmin provisions the first organization', r.status === 201, JSON.stringify(r.data));
+}
+
 // --- projects ---
 const pname = `Smoke Test ${Date.now()}`;
 r = await sa.req('POST', '/api/projects', { name: pname, dialect: 'Dëne Sųłıné' });
@@ -1032,8 +1041,9 @@ await ps.req('POST', '/api/login', { email: psEmail, password: 'platform-pass-1'
 r = await ps.req('GET', '/api/projects');
 check('platform admin without org grant sees no projects', r.status === 200 && r.data.projects.length === 0,
   JSON.stringify(r.data.projects?.length));
-// find an existing corpus project id from sa's view for the 403 probes
-const anyProj = (await sa.req('GET', '/api/projects')).data.projects[0];
+// a dedicated corpus project for the 403 probes (fresh installs have none left)
+const sepProbeName = `Sep Probe ${Date.now()}`;
+const anyProj = (await sa.req('POST', '/api/projects', { name: sepProbeName })).data;
 // With zero visible projects, /entries short-circuits to an empty 200 — either
 // way, no corpus content comes back.
 r = await ps.req('GET', `/api/entries?project_id=${anyProj.id}`);
@@ -1043,6 +1053,7 @@ r = await ps.req('GET', `/api/projects/${anyProj.id}/stats`);
 check('platform admin cannot read stats', r.status === 403);
 r = await ps.raw('GET', `/api/projects/${anyProj.id}/export-bundle`);
 check('platform admin cannot export the corpus', r.status === 403);
+await sa.req('DELETE', `/api/projects/${anyProj.id}`, { confirm_name: sepProbeName });
 r = await ps.req('GET', '/api/compensation');
 check('platform admin cannot read compensation', r.status === 403);
 r = await ps.req('POST', '/api/projects', { name: `No Org ${Date.now()}` });
@@ -1315,6 +1326,36 @@ check('tts test profile deleted (cleanup)', r.status === 200);
 await sa.req('DELETE', `/api/projects/${cpId}`, { confirm_name: cpName });
 r = await sa.req('DELETE', `/api/consent-profiles/${profId}`);
 check('consent profile deleted (cleanup)', r.status === 200);
+
+// --- hashed session tokens (hardening #10) ---
+// Local-only: inspect the same SQLite file the server uses (dev DB, or the
+// runner's DENE_DATA_DIR temp DB) to prove the raw cookie token is never at rest.
+if (BASE.includes('localhost')) {
+  try {
+    const { default: db } = await import('../src/db.js');
+    const res = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: SA_EMAIL, password: SA_PASS }),
+    });
+    const rawToken = /dene_session=([a-f0-9]+)/.exec(res.headers.get('set-cookie') ?? '')?.[1];
+    check('login sets a raw session token cookie', !!rawToken && rawToken.length === 64);
+    check('raw token is NOT stored in the database',
+      !db.prepare('SELECT 1 FROM sessions WHERE token = ?').get(rawToken));
+    const cryptoMod = await import('node:crypto');
+    const hashed = cryptoMod.createHash('sha256').update(rawToken).digest('hex');
+    check('hashed token IS stored and resolves the session',
+      !!db.prepare('SELECT 1 FROM sessions WHERE token = ?').get(hashed));
+    const me = await fetch(BASE + '/api/me', { headers: { Cookie: `dene_session=${rawToken}` } });
+    check('cookie with the raw token authenticates via hashed lookup', me.status === 200);
+    const bogus = await fetch(BASE + '/api/me', { headers: { Cookie: `dene_session=${'0'.repeat(64)}` } });
+    check('a random token fails', bogus.status === 401);
+    await fetch(BASE + '/api/logout', { method: 'POST', headers: { Cookie: `dene_session=${rawToken}` } });
+    check('logout deletes the hashed session row',
+      !db.prepare('SELECT 1 FROM sessions WHERE token = ?').get(hashed));
+  } catch (e) {
+    check('hashed-session DB inspection ran', false, e.message);
+  }
+}
 
 console.log(failures ? `\n${failures} FAILURES` : '\nAll checks passed.');
 process.exit(failures ? 1 : 0);
