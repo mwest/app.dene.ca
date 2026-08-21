@@ -6,7 +6,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "create-superadmin": "node scripts/create-superadmin.js"
+    "create-superadmin": "node scripts/create-superadmin.js",
+    "test": "node scripts/run-tests.js"
   },
   "license": "UNLICENSED",
   "dependencies": {

@@ -5,6 +5,12 @@ import db from './db.js';
 const SESSION_DAYS = 30;
 export const COOKIE_NAME = 'dene_session';
 
+// Sessions are stored HASHED at rest (hardening #10): the DB holds
+// sha256(token), the raw high-entropy token lives only in the client cookie.
+// Database exfiltration therefore never yields usable bearer tokens — the same
+// pattern password-reset tokens already use.
+const hashSessionToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
+
 export function hashPassword(plain) {
   return bcrypt.hashSync(plain, 12);
 }
@@ -18,12 +24,12 @@ export function createSession(userId) {
   db.prepare(
     `INSERT INTO sessions (token, user_id, expires_at)
      VALUES (?, ?, datetime('now', '+${SESSION_DAYS} days'))`
-  ).run(token, userId);
-  return token;
+  ).run(hashSessionToken(token), userId);
+  return token; // raw token goes to the cookie only
 }
 
 export function destroySession(token) {
-  db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+  db.prepare('DELETE FROM sessions WHERE token = ?').run(hashSessionToken(token));
 }
 
 export function userForToken(token) {
@@ -35,7 +41,7 @@ export function userForToken(token) {
        FROM sessions s JOIN users u ON u.id = s.user_id
        WHERE s.token = ?`
     )
-    .get(token);
+    .get(hashSessionToken(token));
 }
 
 /** Express middleware: attach req.user or reject with 401. */

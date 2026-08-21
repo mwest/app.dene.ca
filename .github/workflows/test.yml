@@ -1,0 +1,24 @@
+# Run the full smoke suite (npm test) on every PR and push to main. The suite
+# covers the product invariants: tenancy isolation, work-item billing
+# idempotency, archival versioning + checksums, consent semantics, exports.
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # ffmpeg is optional (the suite passes without it; the app degrades
+      # gracefully), but installing it exercises the derivative path too.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: npm test
