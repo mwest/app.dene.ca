@@ -7,7 +7,8 @@ import { parseFile } from 'music-metadata';
 
 import db, { AUDIO_DIR, REQUESTS_DIR, roleIn, projectsFor, projectIdsFor } from './db.js';
 import { embed, toBlob, fromBlob, cosine, MODEL } from './embed.js';
-import { MASTERS_DIR, DERIVED_DIR, probeAudio, enqueueDerivative } from './audio.js';
+import { MASTERS_DIR, DERIVED_DIR, probeAudio, enqueueDerivative, sha256File } from './audio.js';
+import { createRequire } from 'node:module';
 import { backfillEmbeddings } from '../scripts/embed-backfill.js';
 import { APP_URL, inviteEmail, requestFormEmail, requestNotifyEmail, resetEmail, sendMail } from './mail.js';
 import {
@@ -23,6 +24,11 @@ import {
 
 const api = express.Router();
 api.use(express.json());
+
+// archiver is CommonJS (classic factory API); pkg version goes in the export manifest.
+const cjsRequire = createRequire(import.meta.url);
+const archiver = cjsRequire('archiver');
+const pkg = cjsRequire('../package.json');
 
 const bad = (res, msg, code = 400) => res.status(code).json({ error: msg });
 
@@ -1492,6 +1498,169 @@ api.get('/projects/:id/export', requireProjectAdmin, (req, res) => {
     exported_at: new Date().toISOString(),
     entries: rows.map((r) => ({ ...r, audio: audioByEntry.get(r.id) ?? [] })),
   });
+});
+
+// Owner archive (#7): a single streamed ZIP with the entries, the actual master
+// recordings (+ playback derivatives), machine-readable metadata, and SHA-256
+// checksums that match the DB — restorable without the running app. Includes each
+// recording's CURRENT master (or legacy file); superseded versions stay in the app
+// (noted in the manifest). Purpose-filtered exports / permissions await #6.
+const csvEsc = (v) => {
+  if (v === null || v === undefined) return '';
+  const s = String(v);
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+const sha256Hex = (str) => crypto.createHash('sha256').update(str).digest('hex');
+
+api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => {
+  const kind = req.query.kind === 'word' || req.query.kind === 'phrase' ? req.query.kind : null;
+  const kindSql = kind ? ' AND e.kind = ?' : '';
+  const kindArg = kind ? [kind] : [];
+
+  const rows = db
+    .prepare(
+      `SELECT e.id, e.kind, e.dene_text, e.english_text, e.source_doc, e.notes, e.category, e.status,
+              cu.name AS contributor, e.created_at, e.updated_at
+       FROM entries e JOIN users cu ON cu.id = e.created_by
+       WHERE e.project_id = ?${kindSql} ORDER BY e.id`
+    )
+    .all(req.project.id, ...kindArg);
+  const recs = db
+    .prepare(
+      `SELECT a.*, uu.name AS uploaded_by_name FROM audio_files a
+       JOIN entries e ON e.id = a.entry_id
+       JOIN users uu ON uu.id = a.uploaded_by
+       WHERE e.project_id = ? AND a.is_current = 1${kindSql}
+       ORDER BY a.entry_id, a.language, a.id`
+    )
+    .all(req.project.id, ...kindArg);
+
+  // Pre-scan files BEFORE we start streaming (headers commit on first byte): collect
+  // the include-list, checksums, and per-entry audio refs; skip any missing files.
+  const files = [];         // { abs, name } to stream from disk
+  const checksumLines = [];
+  const audioByEntry = new Map();
+  const recordingsJson = [];
+  let masterCount = 0, legacyCount = 0, derivCount = 0, missing = 0;
+
+  for (const a of recs) {
+    const abs = path.join(AUDIO_DIR, a.stored_name);
+    const bundlePath = `audio/${a.stored_name}`;
+    if (!fs.existsSync(abs)) { missing++; continue; }
+    let sha = a.sha256;
+    if (!sha) {
+      try { sha = await sha256File(abs); db.prepare('UPDATE audio_files SET sha256 = ? WHERE id = ?').run(sha, a.id); }
+      catch { /* leave unchecked */ }
+    }
+    files.push({ abs, name: bundlePath });
+    if (sha) checksumLines.push(`${sha}  ${bundlePath}`);
+    if (a.archive_class === 'legacy_lossy') legacyCount++; else masterCount++;
+
+    let derivPath = null;
+    if (a.playback_stored_name) {
+      const dabs = path.join(AUDIO_DIR, a.playback_stored_name);
+      if (fs.existsSync(dabs)) {
+        derivPath = `audio/${a.playback_stored_name}`;
+        files.push({ abs: dabs, name: derivPath });
+        derivCount++;
+        try { checksumLines.push(`${await sha256File(dabs)}  ${derivPath}`); } catch { /* skip */ }
+      }
+    }
+
+    if (!audioByEntry.has(a.entry_id)) audioByEntry.set(a.entry_id, []);
+    audioByEntry.get(a.entry_id).push({ language: a.language, file: bundlePath });
+    recordingsJson.push({
+      entry_id: a.entry_id, language: a.language, speaker: a.speaker, uploaded_by: a.uploaded_by_name,
+      archive_class: a.archive_class, duration_seconds: a.duration_seconds,
+      sample_rate_hz: a.sample_rate_hz, channels: a.channels, bit_depth: a.bit_depth, codec: a.codec,
+      sha256: sha ?? null, file: bundlePath, derivative: derivPath,
+    });
+  }
+
+  // --- generated text files (built in memory so we can checksum them) ---
+  const csvHeader = 'entry_id,kind,dene_text,english_text,category,source_doc,notes,status,contributor,created_at,updated_at,dene_audio_files,english_audio_files\n';
+  const entriesCsv = '﻿' + csvHeader + rows.map((r) => {
+    const au = audioByEntry.get(r.id) ?? [];
+    return [
+      r.id, r.kind, r.dene_text, r.english_text, r.category, r.source_doc, r.notes, r.status,
+      r.contributor, r.created_at, r.updated_at,
+      au.filter((x) => x.language === 'dene').map((x) => x.file).join(';'),
+      au.filter((x) => x.language === 'english').map((x) => x.file).join(';'),
+    ].map(csvEsc).join(',');
+  }).join('\n') + '\n';
+  const entriesJson = JSON.stringify(
+    { project: { id: req.project.id, name: req.project.name, dialect: req.project.dialect },
+      entries: rows.map((r) => ({ ...r, audio: audioByEntry.get(r.id) ?? [] })) }, null, 2);
+  const speakerCount = new Map(), uploaderCount = new Map();
+  for (const a of recordingsJson) {
+    if (a.speaker) speakerCount.set(a.speaker, (speakerCount.get(a.speaker) ?? 0) + 1);
+    uploaderCount.set(a.uploaded_by, (uploaderCount.get(a.uploaded_by) ?? 0) + 1);
+  }
+  const speakersJson = JSON.stringify({
+    speakers: [...speakerCount].map(([name, recordings]) => ({ name, recordings })),
+    uploaders: [...uploaderCount].map(([name, recordings]) => ({ name, recordings })),
+  }, null, 2);
+  const recordingsJsonStr = JSON.stringify({ recordings: recordingsJson }, null, 2);
+  const manifest = {
+    schema_version: '1.0',
+    exported_at: new Date().toISOString(),
+    application_version: pkg.version,
+    organization: null, // reserved for #5
+    project: { id: req.project.id, name: req.project.name, dialect: req.project.dialect },
+    kind: kind || 'all',
+    entry_count: rows.length,
+    recording_count: masterCount + legacyCount,
+    master_audio_count: masterCount,
+    legacy_lossy_audio_count: legacyCount,
+    derivative_count: derivCount,
+    missing_files: missing,
+    note: 'Contains the current version of each recording. Superseded (re-recorded) master versions are retained in the application and are not included in this archive.',
+  };
+  const manifestStr = JSON.stringify(manifest, null, 2);
+  const readme = [
+    `Dene Voice Library — corpus export`,
+    `Project: ${req.project.name}${req.project.dialect ? ` (${req.project.dialect})` : ''}`,
+    `Exported: ${manifest.exported_at}  ·  app v${pkg.version}  ·  schema ${manifest.schema_version}`,
+    ``,
+    `Contents:`,
+    `  manifest.json     summary + counts`,
+    `  entries.csv/json  the dictionary/phrase entries`,
+    `  recordings.json   one record per current recording, with audio properties + sha256`,
+    `  speakers.json     speakers and uploaders with counts`,
+    `  checksums.sha256  SHA-256 of every file below (verify: sha256sum -c checksums.sha256)`,
+    `  audio/masters/    lossless WAV masters (source of truth)`,
+    `  audio/derived/    disposable mono-MP3 playback copies (regenerable from masters)`,
+    `  audio/<uid>/      legacy lossy source recordings (pre-dating lossless capture)`,
+    ``,
+    `Master checksums match the values stored in the application database.`,
+    `${missing ? `NOTE: ${missing} referenced file(s) were missing on the server and were omitted.` : ''}`,
+  ].join('\n');
+
+  // Text files also go into checksums.sha256 (which necessarily can't list itself).
+  for (const [name, content] of [
+    ['manifest.json', manifestStr], ['README.txt', readme], ['entries.csv', entriesCsv],
+    ['entries.json', entriesJson], ['recordings.json', recordingsJsonStr], ['speakers.json', speakersJson],
+  ]) checksumLines.push(`${sha256Hex(content)}  ${name}`);
+  const checksumsStr = checksumLines.join('\n') + '\n';
+
+  // --- stream the ZIP ---
+  const stamp = new Date().toISOString().slice(0, 10);
+  const base = `${req.project.name.replace(/[^\w-]+/g, '_')}_${stamp}${kind ? `_${kind}s` : ''}_archive`;
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="${base}.zip"`);
+  const archive = archiver('zip', { store: true }); // audio is incompressible; STORE keeps CPU low
+  archive.on('warning', (err) => console.warn('[export] archive warning:', err.message));
+  archive.on('error', (err) => { console.error('[export] archive error:', err.message); res.destroy(err); });
+  archive.pipe(res);
+  archive.append(manifestStr, { name: 'manifest.json' });
+  archive.append(readme, { name: 'README.txt' });
+  archive.append(entriesCsv, { name: 'entries.csv' });
+  archive.append(entriesJson, { name: 'entries.json' });
+  archive.append(recordingsJsonStr, { name: 'recordings.json' });
+  archive.append(speakersJson, { name: 'speakers.json' });
+  archive.append(checksumsStr, { name: 'checksums.sha256' });
+  for (const f of files) archive.file(f.abs, { name: f.name });
+  archive.finalize();
 });
 
 // ---------------------------------------------------------------------------

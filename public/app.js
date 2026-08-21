@@ -947,7 +947,8 @@ async function renderEntries(kind = 'word') {
       <div class="head-actions">
         ${isAdminOf(ap.id) ? `
           <a class="btn secondary small" href="/api/projects/${ap.id}/export?format=csv&kind=${kind}">Export CSV</a>
-          <a class="btn secondary small" href="/api/projects/${ap.id}/export?format=json&kind=${kind}">Export JSON</a>` : ''}
+          <a class="btn secondary small" href="/api/projects/${ap.id}/export?format=json&kind=${kind}">Export JSON</a>
+          <a class="btn secondary small" href="/api/projects/${ap.id}/export-bundle?kind=${kind}" title="Complete archive: entries + master audio + checksums">⬇ Full archive (ZIP)</a>` : ''}
         <a class="btn" href="#/${isPhrase ? 'phrases' : 'entries'}/new">＋ New ${isPhrase ? 'phrase' : 'entry'}</a>
       </div>
     </div>
@@ -2093,7 +2094,8 @@ function projectCardHtml(p) {
         ${admin ? `
           <button class="ghost small" data-proj-action="members" data-id="${p.id}">Members</button>
           <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/projects/${p.id}/export?format=csv">Export CSV</a>
-          <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/projects/${p.id}/export?format=json">Export JSON</a>` : ''}
+          <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/projects/${p.id}/export?format=json">Export JSON</a>
+          <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/projects/${p.id}/export-bundle" title="Complete archive: entries + master audio + checksums">⬇ Full archive (ZIP)</a>` : ''}
         ${state.me.user.is_superadmin ? `
           <button class="ghost small" data-proj-action="edit" data-id="${p.id}">Edit</button>
           <button class="ghost small" data-proj-action="import" data-id="${p.id}" data-name="${esc(p.name)}">Import CSV</button>
