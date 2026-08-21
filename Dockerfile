@@ -2,6 +2,11 @@ FROM node:22-slim
 
 WORKDIR /app
 
+# ffmpeg generates the mono MP3 playback derivatives from the WAV masters (#8b).
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ffmpeg \
+  && rm -rf /var/lib/apt/lists/*
+
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 

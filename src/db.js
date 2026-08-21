@@ -90,7 +90,26 @@ CREATE TABLE IF NOT EXISTS audio_files (
   speaker          TEXT,
   recording_notes  TEXT,
   uploaded_by      INTEGER NOT NULL REFERENCES users(id),
-  created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+  -- Archival versioning (#8b): the current row per (entry, uploaded_by, language)
+  -- has is_current=1; re-recording supersedes the old row rather than overwriting
+  -- it, so masters are never destroyed. New recordings are 'lossless_master';
+  -- pre-existing MP3/M4A recordings are 'legacy_lossy'. stored_name is the master;
+  -- playback_stored_name is a disposable mono MP3 derivative served for playback.
+  -- archive_class/capture_method allowed values are enforced in the API (ALTER
+  -- can't add a CHECK, so we keep the columns plain for migrated DBs too).
+  is_current           INTEGER NOT NULL DEFAULT 1,
+  supersedes_audio_id  INTEGER,
+  archive_class        TEXT,     -- 'lossless_master' | 'legacy_lossy'
+  sha256               TEXT,
+  sample_rate_hz       INTEGER,
+  channels             INTEGER,
+  bit_depth            INTEGER,
+  codec                TEXT,
+  playback_stored_name TEXT,
+  playback_mime_type   TEXT,
+  capture_method       TEXT,     -- 'browser_recording' | 'uploaded_file'
+  capture_device       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audio_entry ON audio_files(entry_id);
 
@@ -221,6 +240,28 @@ if (!audioCols.includes('language')) {
            CHECK (language IN ('dene', 'english'))`);
 }
 
+// Migration (#8b): archival versioning + provenance columns on recordings.
+for (const [col, ddl] of [
+  ['is_current', `ALTER TABLE audio_files ADD COLUMN is_current INTEGER NOT NULL DEFAULT 1`],
+  ['supersedes_audio_id', `ALTER TABLE audio_files ADD COLUMN supersedes_audio_id INTEGER`],
+  ['archive_class', `ALTER TABLE audio_files ADD COLUMN archive_class TEXT`],
+  ['sha256', `ALTER TABLE audio_files ADD COLUMN sha256 TEXT`],
+  ['sample_rate_hz', `ALTER TABLE audio_files ADD COLUMN sample_rate_hz INTEGER`],
+  ['channels', `ALTER TABLE audio_files ADD COLUMN channels INTEGER`],
+  ['bit_depth', `ALTER TABLE audio_files ADD COLUMN bit_depth INTEGER`],
+  ['codec', `ALTER TABLE audio_files ADD COLUMN codec TEXT`],
+  ['playback_stored_name', `ALTER TABLE audio_files ADD COLUMN playback_stored_name TEXT`],
+  ['playback_mime_type', `ALTER TABLE audio_files ADD COLUMN playback_mime_type TEXT`],
+  ['capture_method', `ALTER TABLE audio_files ADD COLUMN capture_method TEXT`],
+  ['capture_device', `ALTER TABLE audio_files ADD COLUMN capture_device TEXT`],
+]) {
+  if (!audioCols.includes(col)) db.exec(ddl);
+}
+// Recordings that predate #8b are legacy lossy source assets (kept, not
+// transcoded). New recordings set archive_class='lossless_master' explicitly, so
+// they are never NULL — this only ever labels pre-existing rows.
+db.exec(`UPDATE audio_files SET archive_class = 'legacy_lossy' WHERE archive_class IS NULL`);
+
 // Migration: optional category on entries.
 const entryCols = db.prepare(`PRAGMA table_info(entries)`).all().map((c) => c.name);
 if (!entryCols.includes('category')) {
@@ -267,9 +308,13 @@ if (!memTableSql.includes('translator')) {
   db.pragma('foreign_keys = ON');
 }
 
-// Each user gets at most one recording per language per entry.
-db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_one_per_lang
-         ON audio_files(entry_id, uploaded_by, language)`);
+// Each user gets at most one CURRENT recording per language per entry. Superseded
+// versions share the same (entry, uploaded_by, language), so the uniqueness is
+// scoped to is_current=1. Replaces the old unconditional index (#8b).
+db.exec(`DROP INDEX IF EXISTS idx_audio_one_per_lang`);
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_current_one_per_lang
+         ON audio_files(entry_id, uploaded_by, language) WHERE is_current = 1`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_audio_supersedes ON audio_files(supersedes_audio_id)`);
 
 // Migration: ledger idempotency. Link each billed row to its work_item and make
 // that link unique, so re-submitting a work item can never double-bill. Legacy

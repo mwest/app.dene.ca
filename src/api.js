@@ -7,6 +7,7 @@ import { parseFile } from 'music-metadata';
 
 import db, { AUDIO_DIR, REQUESTS_DIR, roleIn, projectsFor, projectIdsFor } from './db.js';
 import { embed, toBlob, fromBlob, cosine, MODEL } from './embed.js';
+import { MASTERS_DIR, DERIVED_DIR, probeAudio, enqueueDerivative } from './audio.js';
 import { backfillEmbeddings } from '../scripts/embed-backfill.js';
 import { APP_URL, inviteEmail, requestFormEmail, requestNotifyEmail, resetEmail, sendMail } from './mail.js';
 import {
@@ -327,9 +328,9 @@ const projectStats = db.prepare(`
   SELECT
     (SELECT COUNT(*) FROM entries e WHERE e.project_id = ?) AS entry_count,
     (SELECT COUNT(*) FROM audio_files a JOIN entries e ON e.id = a.entry_id
-      WHERE e.project_id = ?) AS audio_count,
+      WHERE e.project_id = ? AND a.is_current = 1) AS audio_count,
     (SELECT COALESCE(SUM(a.duration_seconds), 0) FROM audio_files a
-      JOIN entries e ON e.id = a.entry_id WHERE e.project_id = ?) AS audio_seconds
+      JOIN entries e ON e.id = a.entry_id WHERE e.project_id = ? AND a.is_current = 1) AS audio_seconds
 `);
 
 api.get('/projects', (req, res) => {
@@ -384,7 +385,7 @@ api.delete('/projects/:id', requireSuperadmin, (req, res) => {
 
   const files = db
     .prepare(
-      `SELECT a.stored_name FROM audio_files a
+      `SELECT a.stored_name, a.playback_stored_name FROM audio_files a
        JOIN entries e ON e.id = a.entry_id WHERE e.project_id = ?`
     )
     .all(project.id);
@@ -394,9 +395,7 @@ api.delete('/projects/:id', requireSuperadmin, (req, res) => {
     deletedEntries = db.prepare('DELETE FROM entries WHERE project_id = ?').run(project.id).changes;
     db.prepare('DELETE FROM projects WHERE id = ?').run(project.id);
   })();
-  for (const f of files) {
-    fs.rm(path.join(AUDIO_DIR, f.stored_name), { force: true }, () => {});
-  }
+  for (const f of files) rmAudioFiles(f); // remove every version's master + derivative
   res.json({ ok: true, deleted_entries: deletedEntries, deleted_recordings: files.length });
 });
 
@@ -503,7 +502,7 @@ api.get('/users', requireSuperadmin, (req, res) => {
     .prepare(
       `SELECT u.id, u.email, u.name, u.is_superadmin, u.created_at,
               (SELECT COUNT(*) FROM entries e WHERE e.created_by = u.id) AS entry_count,
-              (SELECT COUNT(*) FROM audio_files a WHERE a.uploaded_by = u.id) AS audio_count,
+              (SELECT COUNT(*) FROM audio_files a WHERE a.uploaded_by = u.id AND a.is_current = 1) AS audio_count,
               (SELECT group_concat(p.name || ' (' ||
                         CASE m.role WHEN 'admin' THEN 'Project admin'
                                     WHEN 'translator' THEN 'Translator'
@@ -575,7 +574,7 @@ api.delete('/users/:id', requireSuperadmin, (req, res) => {
   const contributions =
     db.prepare('SELECT COUNT(*) AS n FROM entries WHERE created_by = ? OR updated_by = ?')
       .get(user.id, user.id).n +
-    db.prepare('SELECT COUNT(*) AS n FROM audio_files WHERE uploaded_by = ?').get(user.id).n;
+    db.prepare('SELECT COUNT(*) AS n FROM audio_files WHERE uploaded_by = ? AND is_current = 1').get(user.id).n;
   if (contributions > 0) {
     return bad(
       res,
@@ -683,9 +682,9 @@ const entrySelect = `
          e.created_at, e.updated_at,
          p.name AS project_name, p.dialect,
          cu.name AS created_by_name, uu.name AS updated_by_name,
-         (SELECT COUNT(*) FROM audio_files a WHERE a.entry_id = e.id) AS audio_count,
+         (SELECT COUNT(*) FROM audio_files a WHERE a.entry_id = e.id AND a.is_current = 1) AS audio_count,
          (SELECT COALESCE(SUM(a.duration_seconds), 0) FROM audio_files a
-            WHERE a.entry_id = e.id) AS audio_seconds
+            WHERE a.entry_id = e.id AND a.is_current = 1) AS audio_seconds
   FROM entries e
   JOIN projects p ON p.id = e.project_id
   JOIN users cu ON cu.id = e.created_by
@@ -728,9 +727,9 @@ api.get('/entries', async (req, res) => {
   // has_audio filters on whether ANY user has recorded the entry — useful for
   // admin/list views. All project members can see every recording.
   if (req.query.has_audio === 'yes') {
-    where.push('EXISTS (SELECT 1 FROM audio_files a WHERE a.entry_id = e.id)');
+    where.push('EXISTS (SELECT 1 FROM audio_files a WHERE a.entry_id = e.id AND a.is_current = 1)');
   } else if (req.query.has_audio === 'no') {
-    where.push('NOT EXISTS (SELECT 1 FROM audio_files a WHERE a.entry_id = e.id)');
+    where.push('NOT EXISTS (SELECT 1 FROM audio_files a WHERE a.entry_id = e.id AND a.is_current = 1)');
   }
   // needs_my_audio builds a per-speaker recording queue: entries THIS user has
   // not yet recorded in the given language. One speaker recording an entry does
@@ -739,7 +738,7 @@ api.get('/entries', async (req, res) => {
   if (needsMine === 'dene' || needsMine === 'english') {
     where.push(
       `NOT EXISTS (SELECT 1 FROM audio_files a
-                   WHERE a.entry_id = e.id AND a.uploaded_by = ? AND a.language = ?)`
+                   WHERE a.entry_id = e.id AND a.uploaded_by = ? AND a.language = ? AND a.is_current = 1)`
     );
     params.push(req.user.id, needsMine);
   }
@@ -913,7 +912,7 @@ api.get('/entries/:id', loadEntry, (req, res) => {
     .prepare(
       `SELECT a.*, u.name AS uploaded_by_name FROM audio_files a
        JOIN users u ON u.id = a.uploaded_by
-       WHERE a.entry_id = ?
+       WHERE a.entry_id = ? AND a.is_current = 1
        ORDER BY a.language, a.created_at`
     )
     .all(req.entry.id);
@@ -960,11 +959,11 @@ api.patch('/entries/:id', loadEntry, (req, res) => {
 
 api.delete('/entries/:id', loadEntry, (req, res) => {
   if (!canEditEntry(req)) return bad(res, 'You can only delete your own entries', 403);
-  const files = db.prepare('SELECT stored_name FROM audio_files WHERE entry_id = ?').all(req.entry.id);
+  const files = db
+    .prepare('SELECT stored_name, playback_stored_name FROM audio_files WHERE entry_id = ?')
+    .all(req.entry.id);
   db.prepare('DELETE FROM entries WHERE id = ?').run(req.entry.id);
-  for (const f of files) {
-    fs.rm(path.join(AUDIO_DIR, f.stored_name), { force: true }, () => {});
-  }
+  for (const f of files) rmAudioFiles(f); // every version's master + derivative
   res.json({ ok: true });
 });
 
@@ -1004,9 +1003,9 @@ const audioMimeFor = (storedName) =>
 
 const upload = multer({
   storage: multer.diskStorage({
-    // Files are organized per uploader: data/audio/<userID>/<file>
+    // Masters are organized per uploader: data/audio/masters/<userID>/<file>
     destination: (req, file, cb) => {
-      const dir = path.join(AUDIO_DIR, String(req.user.id));
+      const dir = path.join(MASTERS_DIR, String(req.user.id));
       fs.mkdirSync(dir, { recursive: true });
       cb(null, dir);
     },
@@ -1039,32 +1038,49 @@ function audioUpload(req, res, next) {
   });
 }
 
-async function probeAudio(filePath) {
-  const meta = await parseFile(filePath);
-  const duration = meta.format.duration;
-  if (!duration || !isFinite(duration) || duration <= 0) {
-    throw new Error('no duration');
-  }
-  return duration;
+// Absolute paths of the files backing an audio row (master + optional derivative),
+// for cleanup on delete. probeAudio lives in ./audio.js now.
+function audioFiles(row) {
+  const out = [path.join(AUDIO_DIR, row.stored_name)];
+  if (row.playback_stored_name) out.push(path.join(AUDIO_DIR, row.playback_stored_name));
+  return out;
+}
+const rmAudioFiles = (row) => audioFiles(row).forEach((f) => fs.rm(f, { force: true }, () => {}));
+
+// Save an uploaded master as a NEW immutable version for its slot. The prior
+// current version (if any) is superseded, never overwritten or deleted. Kicks off
+// background derivative generation. Returns { audioId, hadCurrent }. Never bills —
+// callers decide billing (bill once, on the first version for a slot).
+function saveMasterRecording({ entry, userId, file, probe, language, speaker, notes, captureMethod, captureDevice }) {
+  const storedName = `masters/${userId}/${file.filename}`;
+  const prior = db
+    .prepare('SELECT id FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ? AND is_current = 1')
+    .get(entry.id, userId, language);
+  const audioId = db.transaction(() => {
+    if (prior) db.prepare('UPDATE audio_files SET is_current = 0 WHERE id = ?').run(prior.id);
+    return db
+      .prepare(
+        `INSERT INTO audio_files
+           (entry_id, stored_name, original_name, mime_type, size_bytes, duration_seconds,
+            language, speaker, recording_notes, uploaded_by,
+            is_current, supersedes_audio_id, archive_class,
+            sample_rate_hz, channels, bit_depth, codec, capture_method, capture_device)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'lossless_master', ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        entry.id, storedName, file.originalname, file.mimetype || 'application/octet-stream',
+        file.size, probe.duration, language, speaker, notes, userId,
+        prior?.id ?? null, probe.sampleRate, probe.channels, probe.bitDepth, probe.codec,
+        captureMethod || null, captureDevice || null
+      ).lastInsertRowid;
+  })();
+  enqueueDerivative(audioId);
+  return { audioId, hadCurrent: !!prior };
 }
 
-// Insert a new audio_files row and return its id. Shared by the legacy /audio
-// upsert (its create branch) and the work-item recording submit. Never mutates
-// an existing row — re-records that replace a file stay in the legacy path.
-function insertAudioRow({ entryId, userId, storedName, originalName, mime, size, duration, language, speaker, notes }) {
-  return db
-    .prepare(
-      `INSERT INTO audio_files
-         (entry_id, stored_name, original_name, mime_type, size_bytes, duration_seconds,
-          language, speaker, recording_notes, uploaded_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(entryId, storedName, originalName, mime, size, duration, language, speaker, notes, userId)
-    .lastInsertRowid;
-}
-
-// Upsert: each user has at most one recording per language per entry, so a new
-// upload for the same language replaces their previous one.
+// Record (or re-record) a master. Re-recording supersedes the prior version
+// rather than replacing it — old masters are never destroyed (#8b). Billed once,
+// on the first version for a (entry, user, language) slot.
 api.post('/entries/:id/audio', loadEntry, audioUpload, async (req, res) => {
   if (!req.file) return bad(res, 'No audio file provided');
   const filePath = req.file.path;
@@ -1074,44 +1090,27 @@ api.post('/entries/:id/audio', loadEntry, audioUpload, async (req, res) => {
     return bad(res, 'Add the translation before recording this phrase');
   }
   const language = req.body.language === 'english' ? 'english' : 'dene';
-  let duration;
+  let probe;
   try {
-    duration = await probeAudio(filePath);
+    probe = await probeAudio(filePath);
   } catch {
     fs.rm(filePath, { force: true }, () => {});
     return bad(res, 'Could not read that audio file — it may be corrupt or in an unsupported format. The entry was not changed.');
   }
 
-  const storedName = `${req.user.id}/${req.file.filename}`;
-  const mime = req.file.mimetype || 'application/octet-stream';
-  const speaker = req.body.speaker?.trim() || null;
-  const notes = req.body.recording_notes?.trim() || null;
-
-  const existing = db
-    .prepare('SELECT * FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ?')
-    .get(req.entry.id, req.user.id, language);
-
-  let id;
-  if (existing) {
-    db.prepare(
-      `UPDATE audio_files SET stored_name = ?, original_name = ?, mime_type = ?,
-         size_bytes = ?, duration_seconds = ?, speaker = ?, recording_notes = ?,
-         created_at = datetime('now')
-       WHERE id = ?`
-    ).run(storedName, req.file.originalname, mime, req.file.size, duration,
-          speaker ?? existing.speaker, notes ?? existing.recording_notes, existing.id);
-    fs.rm(path.join(AUDIO_DIR, existing.stored_name), { force: true }, () => {});
-    id = existing.id;
-  } else {
-    id = insertAudioRow({
-      entryId: req.entry.id, userId: req.user.id, storedName, originalName: req.file.originalname,
-      mime, size: req.file.size, duration, language, speaker, notes,
-    });
-    // Bill the recording once, on first creation (re-records reuse the row).
-    logWork({ userId: req.user.id, projectId: req.entry.project_id, type: 'recording', entryId: req.entry.id, audioId: id });
+  const { audioId, hadCurrent } = saveMasterRecording({
+    entry: req.entry, userId: req.user.id, file: req.file, probe, language,
+    speaker: req.body.speaker?.trim() || null,
+    notes: req.body.recording_notes?.trim() || null,
+    captureMethod: req.body.capture_method === 'browser_recording' ? 'browser_recording' : 'uploaded_file',
+    captureDevice: req.body.capture_device?.trim() || null,
+  });
+  // Bill once, only for the first version of this slot.
+  if (!hadCurrent) {
+    logWork({ userId: req.user.id, projectId: req.entry.project_id, type: 'recording', entryId: req.entry.id, audioId });
   }
-  res.status(existing ? 200 : 201)
-    .json({ ...db.prepare('SELECT * FROM audio_files WHERE id = ?').get(id), replaced: !!existing });
+  res.status(hadCurrent ? 200 : 201)
+    .json({ ...db.prepare('SELECT * FROM audio_files WHERE id = ?').get(audioId), replaced: hadCurrent });
 });
 
 function loadAudio(req, res, next) {
@@ -1127,13 +1126,48 @@ function loadAudio(req, res, next) {
 
 api.get('/audio/:id/stream', loadAudio, (req, res) => {
   // Any member of the entry's project can listen (loadAudio enforces membership).
-  res.sendFile(path.join(AUDIO_DIR, req.audio.stored_name), {
+  // Serve the lightweight playback derivative when it exists; otherwise stream the
+  // master directly (e.g. before the derivative is generated, or without ffmpeg).
+  const serveName = req.audio.playback_stored_name || req.audio.stored_name;
+  res.sendFile(path.join(AUDIO_DIR, serveName), {
     headers: {
-      'Content-Type': audioMimeFor(req.audio.stored_name),
+      'Content-Type': audioMimeFor(serveName),
       'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(req.audio.original_name)}`,
       'X-Content-Type-Options': 'nosniff',
     },
   });
+});
+
+// Download the archival master (admins and the uploader). Always the lossless
+// original, as an attachment.
+api.get('/audio/:id/master', loadAudio, (req, res) => {
+  if (req.audioRole !== 'admin' && req.audio.uploaded_by !== req.user.id) {
+    return bad(res, 'Only the uploader or a project admin can download the master', 403);
+  }
+  res.sendFile(path.join(AUDIO_DIR, req.audio.stored_name), {
+    headers: {
+      'Content-Type': audioMimeFor(req.audio.stored_name),
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(req.audio.original_name)}`,
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
+});
+
+// Superseded versions of this recording's slot, newest first (uploader/admin).
+api.get('/audio/:id/history', loadAudio, (req, res) => {
+  if (req.audioRole !== 'admin' && req.audio.uploaded_by !== req.user.id) {
+    return bad(res, 'Only the uploader or a project admin can view version history', 403);
+  }
+  const versions = db
+    .prepare(
+      `SELECT id, original_name, duration_seconds, size_bytes, archive_class, sha256,
+              sample_rate_hz, channels, bit_depth, codec, is_current, created_at
+       FROM audio_files
+       WHERE entry_id = ? AND uploaded_by = ? AND language = ? AND is_current = 0
+       ORDER BY id DESC`
+    )
+    .all(req.audio.entry_id, req.audio.uploaded_by, req.audio.language);
+  res.json({ versions });
 });
 
 api.patch('/audio/:id', loadAudio, (req, res) => {
@@ -1153,8 +1187,25 @@ api.delete('/audio/:id', loadAudio, (req, res) => {
   if (req.audioRole !== 'admin' && req.audio.uploaded_by !== req.user.id) {
     return bad(res, 'You can only delete audio you uploaded', 403);
   }
-  db.prepare('DELETE FROM audio_files WHERE id = ?').run(req.audio.id);
-  fs.rm(path.join(AUDIO_DIR, req.audio.stored_name), { force: true }, () => {});
+  const a = req.audio;
+  // Deleting the CURRENT version promotes the most recent superseded version back
+  // to current (so the slot is never left "has history but no current" — that
+  // state would confuse the recording queue and billing). Deleting a superseded
+  // version just removes it. Only the deleted row's files are removed.
+  db.transaction(() => {
+    db.prepare('DELETE FROM audio_files WHERE id = ?').run(a.id);
+    if (a.is_current) {
+      const prev = db
+        .prepare(
+          `SELECT id FROM audio_files
+           WHERE entry_id = ? AND uploaded_by = ? AND language = ? AND is_current = 0
+           ORDER BY id DESC LIMIT 1`
+        )
+        .get(a.entry_id, a.uploaded_by, a.language);
+      if (prev) db.prepare('UPDATE audio_files SET is_current = 1 WHERE id = ?').run(prev.id);
+    }
+  })();
+  rmAudioFiles(a);
   res.json({ ok: true });
 });
 
@@ -1210,7 +1261,7 @@ function submitResult(item) {
     out.entry = db.prepare(`${entrySelect} WHERE e.id = ?`).get(...entryParams(item), item.entry_id);
   } else {
     out.audio = db
-      .prepare('SELECT * FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ? ORDER BY id DESC')
+      .prepare('SELECT * FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ? AND is_current = 1 ORDER BY id DESC')
       .get(item.entry_id, item.assigned_to, item.language);
   }
   return out;
@@ -1264,7 +1315,7 @@ api.post('/projects/:id/work/claim', (req, res) => {
           `SELECT e.id FROM entries e
            WHERE e.project_id = ? AND e.dene_text <> '' AND e.english_text <> ''
              AND NOT EXISTS (SELECT 1 FROM audio_files a WHERE a.entry_id = e.id
-                               AND a.uploaded_by = ? AND a.language = ?)
+                               AND a.uploaded_by = ? AND a.language = ? AND a.is_current = 1)
              AND NOT EXISTS (SELECT 1 FROM work_items w WHERE w.entry_id = e.id
                                AND w.type = 'recording' AND w.language = ? AND w.assigned_to = ?
                                AND w.status IN ('claimed', 'submitted'))
@@ -1334,36 +1385,32 @@ api.post('/work/:id/submit', loadWorkItem, (req, res) => {
       return bad(res, 'Add the translation before recording this phrase');
     }
     const language = item.language === 'english' ? 'english' : 'dene';
-    let duration;
+    let probe;
     try {
-      duration = await probeAudio(filePath); // before the transaction — no awaits inside it
+      probe = await probeAudio(filePath); // before the transactions — no awaits inside them
     } catch {
       fs.rm(filePath, { force: true }, () => {});
       return bad(res, 'Could not read that audio file — it may be corrupt or in an unsupported format. Nothing was changed.');
     }
-    const storedName = `${req.user.id}/${req.file.filename}`;
-    const mime = req.file.mimetype || 'application/octet-stream';
-    const speaker = req.body.speaker?.trim() || null;
-    const notes = req.body.recording_notes?.trim() || null;
-    // Bill-once: if this speaker already has a recording for this slot (e.g. they
-    // recorded it on the entry page mid-session), accept the claim without a
-    // duplicate row or a second ledger entry.
+    // Bill-once: if this speaker already has a CURRENT recording for this slot
+    // (e.g. they recorded it on the entry page mid-session), accept the claim
+    // without a new version or a second ledger entry.
     const existing = db
-      .prepare('SELECT id FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ?')
+      .prepare('SELECT id FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ? AND is_current = 1')
       .get(entry.id, req.user.id, language);
-    db.transaction(() => {
-      if (existing) {
-        acceptWorkItem(item.id);
-      } else {
-        const audioId = insertAudioRow({
-          entryId: entry.id, userId: req.user.id, storedName, originalName: req.file.originalname,
-          mime, size: req.file.size, duration, language, speaker, notes,
-        });
-        acceptWorkItem(item.id);
-        billWorkItem(item, { audioId });
-      }
-    })();
-    if (existing) fs.rm(filePath, { force: true }, () => {}); // discard the duplicate upload
+    if (existing) {
+      db.transaction(() => acceptWorkItem(item.id))();
+      fs.rm(filePath, { force: true }, () => {}); // discard the duplicate upload
+    } else {
+      const { audioId } = saveMasterRecording({
+        entry, userId: req.user.id, file: req.file, probe, language,
+        speaker: req.body.speaker?.trim() || null,
+        notes: req.body.recording_notes?.trim() || null,
+        captureMethod: 'browser_recording',
+        captureDevice: req.body.capture_device?.trim() || null,
+      });
+      db.transaction(() => { acceptWorkItem(item.id); billWorkItem(item, { audioId }); })();
+    }
     return res.json(submitResult(db.prepare('SELECT * FROM work_items WHERE id = ?').get(item.id)));
   });
 });
@@ -1398,7 +1445,8 @@ api.get('/projects/:id/export', requireProjectAdmin, (req, res) => {
   for (const a of db
     .prepare(
       `SELECT a.entry_id, a.stored_name, a.original_name, a.duration_seconds, a.language, a.speaker
-       FROM audio_files a JOIN entries e ON e.id = a.entry_id WHERE e.project_id = ?${kindSql}`
+       FROM audio_files a JOIN entries e ON e.id = a.entry_id
+       WHERE e.project_id = ? AND a.is_current = 1${kindSql}`
     )
     .all(req.project.id, ...kindArg)) {
     if (!audioByEntry.has(a.entry_id)) audioByEntry.set(a.entry_id, []);
