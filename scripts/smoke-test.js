@@ -832,6 +832,29 @@ r = await sa.req('GET', `/api/compensation/${tr2Id}`);
 check('unrated work is logged at amount 0', r.status === 200 &&
   r.data.earned_cents === 0 && r.data.work.length === 1, JSON.stringify(r.data));
 
+// Hardening #8: the rate is LOCKED at claim time. A change after a claim
+// affects only future claims, never work already in someone's hands.
+r = await sa.req('POST', '/api/entries', { project_id: compProj, kind: 'phrase', english_text: 'rate lock' });
+const rateLockPhrase = r.data.id;
+r = await translator.req('POST', `/api/projects/${compProj}/work/claim`, { type: 'translation', limit: 20 });
+const lockedItem = r.data.items.find((i) => i.entry.id === rateLockPhrase);
+await sa.req('PUT', `/api/compensation/${translatorId}/rates`, { project_id: compProj, type: 'translation', rate_cents: 50 });
+r = await translator.req('POST', `/api/work/${lockedItem.work_item_id}/submit`, { dene_text: 'x', english_text: 'rate lock' });
+check('claimed work still submits after a rate change', r.status === 200);
+r = await sa.req('GET', `/api/compensation/${translatorId}`);
+check('ledger shows the CLAIM-time rate (200), not the new rate (50)',
+  r.data.work.some((w) => w.type === 'translation' && w.entry_id === rateLockPhrase && w.amount_cents === 200),
+  JSON.stringify(r.data.work.map((w) => `${w.type}:${w.amount_cents}`)));
+r = await sa.req('POST', '/api/entries', { project_id: compProj, kind: 'phrase', english_text: 'post-change' });
+const postChangePhrase = r.data.id;
+r = await translator.req('POST', `/api/projects/${compProj}/work/claim`, { type: 'translation', limit: 20 });
+const postItem = r.data.items.find((i) => i.entry.id === postChangePhrase);
+await translator.req('POST', `/api/work/${postItem.work_item_id}/submit`, { dene_text: 'y', english_text: 'post-change' });
+r = await sa.req('GET', `/api/compensation/${translatorId}`);
+check('a claim made after the change bills the new rate (50)',
+  r.data.work.some((w) => w.type === 'translation' && w.entry_id === postChangePhrase && w.amount_cents === 50),
+  JSON.stringify(r.data.work.map((w) => `${w.type}:${w.amount_cents}`)));
+
 await sa.req('DELETE', `/api/projects/${compProj}`, { confirm_name: pname + ' Comp' });
 
 // --- removal: immediate access loss, attribution kept ---
@@ -1248,6 +1271,45 @@ check('owner archive labels the lossy source', zipHas(zFull, lossyStored) && zip
 check('owner archive counts superseded versions', zipHas(zFull, '"superseded_version_count": 1'));
 zAsr = await sa.raw('GET', `/api/projects/${cpId}/export-bundle?purpose=asr`);
 check('purpose export excludes superseded versions', !zipHas(zAsr, v1Stored));
+
+// --- consent inheritance on re-record (hardening #7) ---
+// A new take is NOT a new consent event: v2 above must carry v1's snapshot as
+// 'inherited', and a changed project default must not silently expand it.
+r = await sa.req('GET', `/api/entries/${cpEntry2}`);
+let curTake = r.data.audio[0];
+check('re-record inherited the prior consent snapshot', curTake.consent_profile_name === profName &&
+  curTake.consent_method === 'inherited', JSON.stringify({ p: curTake.consent_profile_name, m: curTake.consent_method }));
+r = await sa.req('POST', `/api/orgs/${mainOrgId}/consent-profiles`, { name: `TTS-OK ${Date.now()}`, allow_tts_training: true });
+const ttsProfId = r.data.id;
+await sa.req('PUT', `/api/projects/${cpId}/consent-default`, { profile_id: ttsProfId });
+fd = new FormData(); fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'v3.wav'); fd.append('language', 'dene');
+await sa.req('POST', `/api/entries/${cpEntry2}/audio`, fd, true);
+r = await sa.req('GET', `/api/entries/${cpEntry2}`);
+curTake = r.data.audio[0];
+check('re-record under a new TTS-allowing default stays NOT TTS-approved',
+  curTake.allow_tts_training === 0 && curTake.consent_profile_name === profName && curTake.consent_method === 'inherited',
+  JSON.stringify({ tts: curTake.allow_tts_training, p: curTake.consent_profile_name }));
+r = await sa.req('POST', '/api/entries', { project_id: cpId, dene_text: 'sah', english_text: 'bear (black)' });
+const firstTakeEntry = r.data.id;
+fd = new FormData(); fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'first.wav'); fd.append('language', 'dene');
+r = await sa.req('POST', `/api/entries/${firstTakeEntry}/audio`, fd, true);
+check('a FIRST take under the new default gets the new consent (explicit basis)',
+  r.data.allow_tts_training === 1 && r.data.consent_method === 'project_default_profile', JSON.stringify(r.data.consent_profile_name));
+// consent-unknown also inherits: first take with no default stays unknown even
+// after a default is set and the slot is re-recorded.
+await sa.req('PUT', `/api/projects/${cpId}/consent-default`, { profile_id: null });
+r = await sa.req('POST', '/api/entries', { project_id: cpId, dene_text: 'tthę', english_text: 'star' });
+const unknownEntry = r.data.id;
+fd = new FormData(); fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'u1.wav'); fd.append('language', 'dene');
+r = await sa.req('POST', `/api/entries/${unknownEntry}/audio`, fd, true);
+check('first take with no default is consent-unknown', r.data.consent_profile_name === null);
+await sa.req('PUT', `/api/projects/${cpId}/consent-default`, { profile_id: ttsProfId });
+fd = new FormData(); fd.append('file', new Blob([makeWav(2)], { type: 'audio/wav' }), 'u2.wav'); fd.append('language', 'dene');
+r = await sa.req('POST', `/api/entries/${unknownEntry}/audio`, fd, true);
+check('re-record of a consent-unknown slot STAYS consent-unknown (no silent expansion)',
+  r.data.consent_profile_name === null && r.data.allow_tts_training === null, JSON.stringify(r.data.consent_profile_name));
+r = await sa.req('DELETE', `/api/consent-profiles/${ttsProfId}`);
+check('tts test profile deleted (cleanup)', r.status === 200);
 
 // cleanup: project then profile (suite stays repeatable; snapshots die with the project)
 await sa.req('DELETE', `/api/projects/${cpId}`, { confirm_name: cpName });

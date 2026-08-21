@@ -1339,11 +1339,28 @@ const rmAudioFiles = (row) => audioFiles(row).forEach((f) => fs.rm(f, { force: t
 function saveMasterRecording({ entry, userId, file, probe, sha256 = null, language, speaker, notes, captureMethod, captureDevice }) {
   const storedName = `masters/${userId}/${file.filename}`;
   const prior = db
-    .prepare('SELECT id FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ? AND is_current = 1')
+    .prepare('SELECT * FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ? AND is_current = 1')
     .get(entry.id, userId, language);
-  // Stamp the project's default consent profile (if any) onto the new version at
-  // save time — the recording carries its own immutable permission snapshot (#6).
-  const consent = consentSnapshotFor(entry.project_id);
+  // Consent basis (hardening #7): a routine RE-RECORD is not a new consent
+  // event — the new take INHERITS the effective snapshot of the version it
+  // supersedes (including consent-unknown; the project default never silently
+  // expands permissions on a re-take). Only a FIRST take for the slot is
+  // stamped from the project's default profile. Explicit paths (bulk-assign,
+  // documented admin assignment) remain the way consent actually changes.
+  let consent = null;
+  if (prior) {
+    if (prior.consent_profile_name) {
+      consent = {
+        consent_profile_name: prior.consent_profile_name,
+        consent_method: 'inherited',
+        consent_reference: prior.consent_reference,
+      };
+      for (const f of CONSENT_FLAGS) consent[f] = prior[f];
+    }
+    // prior was consent-unknown -> the new take stays consent-unknown.
+  } else {
+    consent = consentSnapshotFor(entry.project_id);
+  }
   // archive_class comes from the PROBED codec, never the filename or route: an
   // uploaded MP3/M4A is a 'lossy_source', not a master (hardening #4).
   const archiveClass = classifyArchive(probe.codec);
@@ -1367,8 +1384,9 @@ function saveMasterRecording({ entry, userId, file, probe, sha256 = null, langua
     if (consent) {
       db.prepare(
         `UPDATE audio_files SET consent_profile_name = ?, ${CONSENT_FLAGS.map((f) => `${f} = ?`).join(', ')},
-           consent_recorded_at = datetime('now'), consent_method = ? WHERE id = ?`
-      ).run(consent.consent_profile_name, ...CONSENT_FLAGS.map((f) => consent[f]), consent.consent_method, id);
+           consent_recorded_at = datetime('now'), consent_method = ?, consent_reference = ? WHERE id = ?`
+      ).run(consent.consent_profile_name, ...CONSENT_FLAGS.map((f) => consent[f]),
+            consent.consent_method, consent.consent_reference ?? null, id);
     }
     return id;
   })();
@@ -1571,15 +1589,14 @@ function loadWorkItem(req, res, next) {
   next();
 }
 
-// Insert the ledger row for an accepted work item, snapshotting the rate at
-// accept time (matching the legacy "rate at time of work" invariant). Stamps the
-// owning organization so tenant-scoped views survive project deletion. Idempotent:
-// the unique index on work_log(work_item_id) makes a repeat a silent no-op, so a
-// double-submit can never double-bill. Runs inside the caller's transaction.
+// Insert the ledger row for an accepted work item. The amount is the rate
+// SNAPSHOTTED ON THE WORK ITEM at claim/adoption time (hardening #8): once a
+// job is claimed, its pay is locked — an admin rate change affects only future
+// claims, never work already in someone's hands. Stamps the owning organization
+// so tenant-scoped views survive project deletion. Idempotent: the unique index
+// on work_log(work_item_id) makes a repeat a silent no-op, so a double-submit
+// can never double-bill. Runs inside the caller's transaction.
 function billWorkItem(item, { entryId = item.entry_id ?? null, audioId = null }) {
-  const rate = db
-    .prepare('SELECT rate_cents FROM translator_rates WHERE user_id = ? AND project_id = ? AND type = ?')
-    .get(item.assigned_to, item.project_id, item.type);
   const orgId = db
     .prepare('SELECT organization_id FROM projects WHERE id = ?')
     .get(item.project_id)?.organization_id ?? null;
@@ -1588,7 +1605,7 @@ function billWorkItem(item, { entryId = item.entry_id ?? null, audioId = null })
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(work_item_id) WHERE work_item_id IS NOT NULL DO NOTHING`
   ).run(item.assigned_to, item.project_id, item.type, entryId, audioId,
-        rate?.rate_cents ?? 0, item.id, orgId, item.assigned_to);
+        item.rate_cents ?? 0, item.id, orgId, item.assigned_to);
 }
 
 // Guarded accept: only a still-claimed item can transition to accepted. Throwing
